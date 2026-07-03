@@ -20,23 +20,9 @@ async function fetchWithRetry(
 }
 
 interface SegmentationBox {
-  box_2d?: [number, number, number, number]; // [y1, x1, y2, x2] in 0–1000
-  mask?: string; // base64 PNG probability map
+  box_2d?: [number, number, number, number];
+  mask?: string;
   label?: string;
-}
-
-function binarizeMask(maskBuffer: Buffer): Buffer {
-  // Binary threshold at 127 — anything >= 128 becomes white (keep), rest black (discard)
-  const pixels = new Uint8Array(maskBuffer);
-  for (let i = 0; i < pixels.length; i += 4) {
-    const gray = pixels[i]; // R channel (grayscale)
-    const val = gray >= 128 ? 255 : 0;
-    pixels[i] = val;
-    pixels[i + 1] = val;
-    pixels[i + 2] = val;
-    pixels[i + 3] = 255;
-  }
-  return Buffer.from(pixels);
 }
 
 export class GeminiProvider implements ImageAIProvider {
@@ -46,7 +32,6 @@ export class GeminiProvider implements ImageAIProvider {
     this.apiKey = process.env.GEMINI_API_KEY || "";
   }
 
-  // ── Scene Generation ──
   async generateScene(input: SceneInput): Promise<GenResult> {
     const startTime = Date.now();
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${IMAGE_GEN_MODEL}:generateContent?key=${this.apiKey}`;
@@ -96,7 +81,6 @@ export class GeminiProvider implements ImageAIProvider {
     return { imageUrl, seed: input.seed, duration: Date.now() - startTime };
   }
 
-  // ── Layer Extraction (Gemini 2.5 Flash segmentation) ──
   async extractLayers(input: ExtractInput): Promise<LayerResult> {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
 
@@ -106,7 +90,7 @@ export class GeminiProvider implements ImageAIProvider {
 
     const prompt = `Segment this game UI image. For each of these component types: ${componentTypes.join(", ")}, return the bounding box and mask.
 
-Return a JSON array with objects like: {"box_2d": [y1, x1, y2, x2], "label": "PANEL", "mask": "<base64 PNG probability map>"}
+Return a JSON array with objects like: {"box_2d": [y1, x1, y2, x2], "label": "PANEL", "mask": "<base64 PNG grayscale mask>"}
 
 Coordinates are normalized to 0–1000. The mask is a grayscale PNG base64 string where white=keep, black=discard.
 If a component type is not found, omit it from the array.
@@ -123,19 +107,11 @@ Return ONLY the JSON array, no other text.`;
           {
             parts: [
               { text: prompt },
-              {
-                inlineData: {
-                  mimeType: "image/png",
-                  data: base64Image,
-                },
-              },
+              { inlineData: { mimeType: "image/png", data: base64Image } },
             ],
           },
         ],
-        generationConfig: {
-          temperature: 0,
-          thinkingConfig: { thinkingBudget: 0 },
-        },
+        generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 } },
       }),
     });
 
@@ -147,18 +123,14 @@ Return ONLY the JSON array, no other text.`;
     const data = await res.json();
     const candidate = data?.candidates?.[0];
     if (!candidate) throw new Error("Gemini segmentation: no candidate");
-
     const textPart = candidate?.content?.parts?.find((p: any) => p.text);
     if (!textPart) throw new Error("Gemini segmentation: no text response");
 
-    // Parse JSON from response
     const text = textPart.text.trim();
     const jsonMatch = text.match(/\[[\s\S]*\]/);
     if (!jsonMatch) throw new Error(`Gemini segmentation: no JSON found. Got: ${text.slice(0, 200)}`);
-
     const segments: SegmentationBox[] = JSON.parse(jsonMatch[0]);
 
-    // Build full-canvas masks from bbox + mask base64
     const sharp = await import("sharp");
     const imgMeta = await sharp.default(imgBuffer).metadata();
     const canvasW = imgMeta.width || 1024;
@@ -170,9 +142,7 @@ Return ONLY the JSON array, no other text.`;
         if (!seg.mask) return { name: label, type: label, imageUrl: "", maskUrl: "" };
 
         const maskData = Buffer.from(seg.mask, "base64");
-
-        // Build full-canvas mask: place the bbox-scaled mask onto a transparent canvas
-        let finalMaskBuffer: Buffer;
+        let maskCanvas: Buffer;
 
         if (seg.box_2d && seg.box_2d.length === 4) {
           const [y1, x1, y2, x2] = seg.box_2d;
@@ -181,31 +151,36 @@ Return ONLY the JSON array, no other text.`;
           const bw = Math.round(((x2 - x1) / 1000) * canvasW);
           const bh = Math.round(((y2 - y1) / 1000) * canvasH);
 
-          const maskResized = await sharp.default(maskData)
+          const resized = await sharp.default(maskData)
             .resize(Math.max(1, bw), Math.max(1, bh), { fit: "fill" })
-            .ensureAlpha()
             .png()
             .toBuffer();
 
-          const canvas = await sharp.default({
+          maskCanvas = await sharp.default({
             create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
           })
-            .composite([{ input: maskResized, left: bx, top: by }])
+            .composite([{ input: resized, left: bx, top: by }])
             .png()
             .toBuffer();
-
-          finalMaskBuffer = binarizeMask(canvas);
         } else {
-          finalMaskBuffer = binarizeMask(
-            await sharp.default(maskData).resize(canvasW, canvasH, { fit: "fill" }).ensureAlpha().png().toBuffer()
-          );
+          maskCanvas = await sharp.default(maskData)
+            .resize(canvasW, canvasH, { fit: "fill" })
+            .png()
+            .toBuffer();
         }
+
+        // Binarize using sharp threshold (grayscale → binary at 128)
+        const binaryMask = await sharp.default(maskCanvas)
+          .grayscale()
+          .threshold(128)
+          .png()
+          .toBuffer();
 
         return {
           name: label.charAt(0) + label.slice(1).toLowerCase(),
           type: label,
           imageUrl: "",
-          maskUrl: `data:image/png;base64,${finalMaskBuffer.toString("base64")}`,
+          maskUrl: `data:image/png;base64,${binaryMask.toString("base64")}`,
         };
       })
     );
@@ -213,7 +188,6 @@ Return ONLY the JSON array, no other text.`;
     return { components };
   }
 
-  // ── Background Removal (subject segmentation + sharp) ──
   async removeBackground(input: BgInput): Promise<PngResult> {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
 
@@ -229,17 +203,9 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [
-          {
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: "image/png", data: base64Image } },
-            ],
-          },
+          { parts: [{ text: prompt }, { inlineData: { mimeType: "image/png", data: base64Image } }] },
         ],
-        generationConfig: {
-          temperature: 0,
-          thinkingConfig: { thinkingBudget: 0 },
-        },
+        generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 } },
       }),
     });
 
@@ -251,13 +217,11 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
     const data = await res.json();
     const candidate = data?.candidates?.[0];
     if (!candidate) throw new Error("Gemini remove-bg: no candidate");
-
     const textPart = candidate?.content?.parts?.find((p: any) => p.text);
     if (!textPart) throw new Error("Gemini remove-bg: no text response");
 
     const jsonMatch = textPart.text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error(`Gemini remove-bg: no JSON found. Got: ${textPart.text.slice(0, 200)}`);
-
     const seg: SegmentationBox = JSON.parse(jsonMatch[0]);
     if (!seg.mask) return { imageUrl: "" };
 
@@ -267,7 +231,6 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
     const canvasW = imgMeta.width || 1024;
     const canvasH = imgMeta.height || 576;
 
-    // Build full-canvas mask
     let maskCanvas: Buffer;
     if (seg.box_2d && seg.box_2d.length === 4) {
       const [y1, x1, y2, x2] = seg.box_2d;
@@ -294,19 +257,24 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
         .toBuffer();
     }
 
-    // Binarize and apply as alpha
-    const binaryMask = binarizeMask(maskCanvas);
+    // Get binary alpha channel via sharp threshold + raw
+    const alphaRaw = await sharp.default(maskCanvas)
+      .resize(canvasW, canvasH, { fit: "fill" })
+      .grayscale()
+      .threshold(128)
+      .raw()
+      .toBuffer();
+
+    // Apply as alpha channel using joinChannel
     const result = await sharp.default(imgBuffer)
-      .composite([{ input: binaryMask, blend: "dest-in" }])
+      .ensureAlpha()
+      .joinChannel(alphaRaw)
       .png()
       .toBuffer();
 
-    return {
-      imageUrl: `data:image/png;base64,${result.toString("base64")}`,
-    };
+    return { imageUrl: `data:image/png;base64,${result.toString("base64")}` };
   }
 
-  // ── Helpers ──
   private async fetchImageForSegmentation(imageUrl: string): Promise<Buffer> {
     const res = await fetch(imageUrl);
     if (!res.ok) throw new Error(`Failed to fetch image for segmentation: ${res.status}`);

@@ -6,6 +6,17 @@ import { persistImage, persistBase64Image } from "@/lib/storage";
 
 export const maxDuration = 120;
 
+async function fetchBuffer(url: string): Promise<Buffer> {
+  if (url.startsWith("data:")) {
+    const matches = url.match(/^data:image\/\w+;base64,(.+)$/);
+    if (!matches) throw new Error("Invalid data URL");
+    return Buffer.from(matches[1], "base64");
+  }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch: ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
 async function extractComponentWithMask(
   imageUrl: string,
   maskUrl: string,
@@ -14,35 +25,27 @@ async function extractComponentWithMask(
 ): Promise<string> {
   try {
     const sharp = await import("sharp");
-    const res = await fetch(imageUrl);
-    if (!res.ok) throw new Error(`Failed to fetch image: ${res.status}`);
-    const imgBuffer = Buffer.from(await res.arrayBuffer());
+    const [imgBuffer, maskBuffer] = await Promise.all([
+      fetchBuffer(imageUrl),
+      fetchBuffer(maskUrl),
+    ]);
 
     const imgMeta = await sharp.default(imgBuffer).metadata();
+    const w = imgMeta.width || 1024;
+    const h = imgMeta.height || 576;
 
-    // maskUrl can be a data URL or a URL
-    let maskBuffer: Buffer;
-    if (maskUrl.startsWith("data:")) {
-      const matches = maskUrl.match(/^data:image\/\w+;base64,(.+)$/);
-      if (!matches) throw new Error("Invalid mask data URL");
-      maskBuffer = Buffer.from(matches[1], "base64");
-    } else {
-      const maskRes = await fetch(maskUrl);
-      if (!maskRes.ok) throw new Error(`Failed to fetch mask: ${maskRes.status}`);
-      maskBuffer = Buffer.from(await maskRes.arrayBuffer());
-    }
+    // Get binary alpha channel from mask
+    const alphaRaw = await sharp.default(maskBuffer)
+      .resize(w, h, { fit: "fill" })
+      .grayscale()
+      .threshold(128)
+      .raw()
+      .toBuffer();
 
+    // Apply as alpha channel
     const extracted = await sharp.default(imgBuffer)
-      .composite([
-        {
-          input: await sharp.default(maskBuffer)
-            .resize(imgMeta.width!, imgMeta.height!, { fit: "fill" })
-            .grayscale()
-            .png()
-            .toBuffer(),
-          blend: "dest-in",
-        },
-      ])
+      .ensureAlpha()
+      .joinChannel(alphaRaw)
       .png()
       .toBuffer();
 
@@ -56,7 +59,7 @@ async function extractComponentWithMask(
 
     return `data:image/png;base64,${extracted.toString("base64")}`;
   } catch (e) {
-    console.warn(`[extractComponentWithMask] fallback to original for ${label}:`, e);
+    console.warn(`[extractComponentWithMask] fallback for ${label}:`, e);
     return imageUrl;
   }
 }
@@ -80,11 +83,11 @@ export async function POST(req: Request) {
 
     const componentTypes = ["BACKGROUND", "PANEL", "BUTTON", "ICON", "BADGE", "BAR"];
 
-    // Segmentation via provider (Gemini or Replicate)
+    // Segmentation
     const provider = getProvider("extract");
     const segmentResult = await provider.extractLayers({ imageUrl, componentTypes });
 
-    // Remove background fallback
+    // Remove-bg fallback
     const bgProvider = getProvider("removebg");
     let transparentBgUrl = imageUrl;
     try {
@@ -105,14 +108,12 @@ export async function POST(req: Request) {
         let maskUrl = existing?.maskUrl || "";
 
         if (existing?.maskUrl) {
-          // Crop from mask
           pngUrl = await extractComponentWithMask(imageUrl, existing.maskUrl, label, sceneId);
         } else {
-          // Fallback to remove-bg
           pngUrl = transparentBgUrl;
         }
 
-        const isDataUrl = typeof pngUrl === "string" && pngUrl.startsWith("data:");
+        const isDataUrl = pngUrl.startsWith("data:");
         const permanentUrl = isDataUrl
           ? await persistBase64Image(pngUrl, `comp_${sceneId.slice(0, 6)}_${label}`)
           : await persistImage(pngUrl, `comp_${sceneId.slice(0, 6)}_${label}`);

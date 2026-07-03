@@ -8,14 +8,18 @@ import { checkRateLimit } from "@/lib/rate-limit";
 export const maxDuration = 120;
 
 export async function POST(req: Request) {
+  const startTime = Date.now();
+  const stepLog: string[] = [];
   let sceneId: string | null = null;
 
   try {
+    stepLog.push("auth");
     const session = await auth();
     if (!session?.user?.id) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
+    stepLog.push("rate-limit");
     const quota = await checkRateLimit(session.user.id);
     if (!quota.allowed) {
       return NextResponse.json(
@@ -24,25 +28,30 @@ export async function POST(req: Request) {
       );
     }
 
+    stepLog.push("parse-body");
     const { prompt, type, ratio, quality, projectId } = await req.json();
     if (!prompt || !projectId) {
       return NextResponse.json({ error: "Prompt and projectId required" }, { status: 400 });
     }
 
+    stepLog.push("find-project");
     const project = await prisma.project.findFirst({
       where: { id: projectId, userId: session.user.id },
     });
     if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
 
+    stepLog.push("call-ai-provider");
     const providerName = process.env.AI_PROVIDER_GENERATE || "gemini";
     const provider = getProvider("generate");
     const result = await provider.generateScene({ prompt, type, ratio, quality });
 
+    stepLog.push("persist-image");
     const isDataUrl = result.imageUrl.startsWith("data:");
     const permanentUrl = isDataUrl
       ? await persistBase64Image(result.imageUrl, `scene_${projectId.slice(0, 8)}`)
       : await persistImage(result.imageUrl, `scene_${projectId.slice(0, 8)}`);
 
+    stepLog.push("create-scene");
     const scene = await prisma.scene.create({
       data: {
         prompt,
@@ -56,6 +65,7 @@ export async function POST(req: Request) {
     });
     sceneId = scene.id;
 
+    stepLog.push("log-generation");
     await prisma.generation.create({
       data: {
         status: permanentUrl ? "completed" : "failed",
@@ -68,6 +78,7 @@ export async function POST(req: Request) {
       },
     });
 
+    stepLog.push("done");
     return NextResponse.json({
       id: scene.id,
       imageUrl: permanentUrl,
@@ -76,20 +87,23 @@ export async function POST(req: Request) {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
-    console.error("Generate error:", message);
+    const elapsed = Date.now() - startTime;
+    console.error(`[generate] FAILED at step "${stepLog.join(" > ")}" after ${elapsed}ms:`, message);
 
-    // Ghi failed generation nếu đã có sceneId
+    // Log failed generation if scene was created
     if (sceneId) {
-      await prisma.generation.create({
-        data: {
-          status: "failed",
-          provider: process.env.AI_PROVIDER_GENERATE || "gemini",
-          error: message,
-          sceneId,
-        },
-      }).catch(() => {});
+      await prisma.generation
+        .create({
+          data: {
+            status: "failed",
+            provider: process.env.AI_PROVIDER_GENERATE || "gemini",
+            error: message,
+            sceneId,
+          },
+        })
+        .catch(() => {});
     }
 
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: message, step: stepLog.join(" > ") }, { status: 500 });
   }
 }
