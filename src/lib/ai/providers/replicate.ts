@@ -1,5 +1,25 @@
 import { ImageAIProvider, SceneInput, GenResult, ExtractInput, LayerResult, BgInput, PngResult } from "../types";
 
+const MODEL_VERSIONS = {
+  "flux-schnell": "black-forest-labs/flux-schnell",
+  "flux-pro": "black-forest-labs/flux-pro",
+  sam2: "facebook/sam-2",
+  rembg: "cjwbw/rembg",
+} as const;
+
+async function pollPrediction(url: string, token: string, maxRetries = 60, interval = 1000): Promise<any> {
+  for (let i = 0; i < maxRetries; i++) {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    if (data.status === "succeeded") return data;
+    if (data.status === "failed") throw new Error(`Replicate prediction failed: ${data.error}`);
+    await new Promise((r) => setTimeout(r, interval));
+  }
+  throw new Error("Replicate prediction timed out");
+}
+
 export class ReplicateProvider implements ImageAIProvider {
   private apiToken: string;
 
@@ -9,55 +29,85 @@ export class ReplicateProvider implements ImageAIProvider {
 
   async generateScene(input: SceneInput): Promise<GenResult> {
     const startTime = Date.now();
-    const response = await fetch("https://api.replicate.com/v1/predictions", {
+    const res = await fetch("https://api.replicate.com/v1/predictions", {
       method: "POST",
       headers: {
-        Authorization: `Token ${this.apiToken}`,
+        Authorization: `Bearer ${this.apiToken}`,
         "Content-Type": "application/json",
+        Prefer: "wait",
       },
       body: JSON.stringify({
-        version: "black-forest-labs/flux-schnell",
+        version: MODEL_VERSIONS["flux-schnell"],
         input: {
           prompt: input.prompt,
           aspect_ratio: input.ratio || "16:9",
           num_outputs: 1,
+          num_inference_steps: 4,
           ...(input.seed ? { seed: input.seed } : {}),
         },
       }),
     });
-    const data = await response.json();
-    return { imageUrl: data.urls?.get || "", seed: input.seed, duration: Date.now() - startTime };
+    const data = await res.json();
+    if (data.status === "succeeded") {
+      return {
+        imageUrl: Array.isArray(data.output) ? data.output[0] : data.output,
+        seed: input.seed,
+        duration: Date.now() - startTime,
+      };
+    }
+    const polled = await pollPrediction(data.urls?.get, this.apiToken);
+    return {
+      imageUrl: Array.isArray(polled.output) ? polled.output[0] : polled.output,
+      seed: input.seed,
+      duration: Date.now() - startTime,
+    };
   }
 
   async extractLayers(input: ExtractInput): Promise<LayerResult> {
-    const response = await fetch("https://api.replicate.com/v1/predictions", {
+    const startTime = Date.now();
+    const res = await fetch("https://api.replicate.com/v1/predictions", {
       method: "POST",
       headers: {
-        Authorization: `Token ${this.apiToken}`,
+        Authorization: `Bearer ${this.apiToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        version: "facebook/sam-2",
+        version: MODEL_VERSIONS.sam2,
         input: { image: input.imageUrl },
       }),
     });
-    const data = await response.json();
-    return { components: [] };
+    const data = await res.json();
+    const polled = await pollPrediction(data.urls?.get, this.apiToken);
+    const maskUrl = Array.isArray(polled.output) ? polled.output[0] : polled.output;
+    const componentTypes = input.componentTypes ?? [
+      "BACKGROUND", "PANEL", "BUTTON", "ICON", "BADGE", "BAR",
+    ];
+    const components = componentTypes.map((type, i) => ({
+      name: type.charAt(0) + type.slice(1).toLowerCase(),
+      type,
+      imageUrl: maskUrl,
+      maskUrl,
+    }));
+    return { components };
   }
 
   async removeBackground(input: BgInput): Promise<PngResult> {
-    const response = await fetch("https://api.replicate.com/v1/predictions", {
+    const startTime = Date.now();
+    const res = await fetch("https://api.replicate.com/v1/predictions", {
       method: "POST",
       headers: {
-        Authorization: `Token ${this.apiToken}`,
+        Authorization: `Bearer ${this.apiToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        version: "cjwbw/rembg:fb8af45114f238a0e3d7c5c3d5f1f8d8e8c8e8c8",
+        version: MODEL_VERSIONS.rembg,
         input: { image: input.imageUrl },
       }),
     });
-    const data = await response.json();
-    return { imageUrl: data.urls?.get || "" };
+    const data = await res.json();
+    const polled = await pollPrediction(data.urls?.get, this.apiToken);
+    return {
+      imageUrl: Array.isArray(polled.output) ? polled.output[0] : polled.output,
+    };
   }
 }
