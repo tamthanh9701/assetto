@@ -265,10 +265,10 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
       .raw()
       .toBuffer();
 
-    // Apply as alpha channel using joinChannel
+    // Apply as alpha channel — removeAlpha + joinChannel with raw option
     const result = await sharp.default(imgBuffer)
-      .ensureAlpha()
-      .joinChannel(alphaRaw)
+      .removeAlpha()
+      .joinChannel(alphaRaw, { raw: { width: canvasW, height: canvasH, channels: 1 } })
       .png()
       .toBuffer();
 

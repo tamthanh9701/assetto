@@ -42,10 +42,10 @@ async function extractComponentWithMask(
       .raw()
       .toBuffer();
 
-    // Apply as alpha channel
+    // Apply as alpha channel — removeAlpha ensures RGB, joinChannel adds alpha with raw option
     const extracted = await sharp.default(imgBuffer)
-      .ensureAlpha()
-      .joinChannel(alphaRaw)
+      .removeAlpha()
+      .joinChannel(alphaRaw, { raw: { width: w, height: h, channels: 1 } })
       .png()
       .toBuffer();
 
