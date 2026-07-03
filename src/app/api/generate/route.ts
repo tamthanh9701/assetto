@@ -3,6 +3,7 @@ import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { getProvider } from "@/lib/ai/registry";
 import { persistImage, persistBase64Image } from "@/lib/storage";
+import { checkRateLimit } from "@/lib/rate-limit";
 
 export const maxDuration = 120;
 
@@ -11,6 +12,18 @@ export async function POST(req: Request) {
     const session = await auth();
     if (!session?.user?.id) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    // Rate limit check
+    const quota = await checkRateLimit(session.user.id);
+    if (!quota.allowed) {
+      return NextResponse.json(
+        {
+          error: `Daily limit reached (${quota.limit} generations). Please try again tomorrow.`,
+          quota,
+        },
+        { status: 429 }
+      );
     }
 
     const { prompt, type, ratio, quality, projectId } = await req.json();

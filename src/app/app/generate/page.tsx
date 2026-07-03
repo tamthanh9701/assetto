@@ -331,6 +331,21 @@ export default function GeneratePage() {
               </CardDescription>
             </CardHeader>
             <CardContent>
+              <div className="flex gap-2 mb-4">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-2"
+                  onClick={() => {
+                    if (sceneResult?.id) {
+                      window.open(`/api/export?sceneId=${sceneResult.id}&format=zip`, "_blank");
+                    }
+                  }}
+                  disabled={!sceneResult?.id}
+                >
+                  <Download className="w-4 h-4" /> Download All as ZIP
+                </Button>
+              </div>
               <div className="space-y-2">
                 {components.map((comp, i) => (
                   <div
@@ -352,8 +367,19 @@ export default function GeneratePage() {
                         </p>
                       </div>
                     </div>
-                    <Button variant="outline" size="sm">
-                      Download
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        const assetId = comp.imageUrl.split("/").pop()?.split(".")[0];
+                        if (assetId) {
+                          window.open(`/api/export?assetId=${assetId}`, "_blank");
+                        } else {
+                          window.open(comp.imageUrl, "_blank");
+                        }
+                      }}
+                    >
+                      <Download className="w-4 h-4 mr-1" /> Download
                     </Button>
                   </div>
                 ))}
