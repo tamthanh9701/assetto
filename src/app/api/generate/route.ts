@@ -8,20 +8,18 @@ import { checkRateLimit } from "@/lib/rate-limit";
 export const maxDuration = 120;
 
 export async function POST(req: Request) {
+  let sceneId: string | null = null;
+
   try {
     const session = await auth();
     if (!session?.user?.id) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // Rate limit check
     const quota = await checkRateLimit(session.user.id);
     if (!quota.allowed) {
       return NextResponse.json(
-        {
-          error: `Daily limit reached (${quota.limit} generations). Please try again tomorrow.`,
-          quota,
-        },
+        { error: `Daily limit reached (${quota.limit} generations).`, quota },
         { status: 429 }
       );
     }
@@ -36,11 +34,10 @@ export async function POST(req: Request) {
     });
     if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
 
-    const providerName = process.env.AI_PROVIDER_GENERATE || "replicate";
+    const providerName = process.env.AI_PROVIDER_GENERATE || "gemini";
     const provider = getProvider("generate");
     const result = await provider.generateScene({ prompt, type, ratio, quality });
 
-    // Persist ảnh vào storage vĩnh viễn
     const isDataUrl = result.imageUrl.startsWith("data:");
     const permanentUrl = isDataUrl
       ? await persistBase64Image(result.imageUrl, `scene_${projectId.slice(0, 8)}`)
@@ -57,6 +54,7 @@ export async function POST(req: Request) {
         projectId,
       },
     });
+    sceneId = scene.id;
 
     await prisma.generation.create({
       data: {
@@ -66,6 +64,7 @@ export async function POST(req: Request) {
         resultUrl: permanentUrl,
         duration: result.duration,
         sceneId: scene.id,
+        error: permanentUrl ? null : "No image URL returned from provider",
       },
     });
 
@@ -76,7 +75,21 @@ export async function POST(req: Request) {
       seed: result.seed,
     });
   } catch (err) {
-    console.error("Generate error:", err);
-    return NextResponse.json({ error: "Generation failed" }, { status: 500 });
+    const message = err instanceof Error ? err.message : "Unknown error";
+    console.error("Generate error:", message);
+
+    // Ghi failed generation nếu đã có sceneId
+    if (sceneId) {
+      await prisma.generation.create({
+        data: {
+          status: "failed",
+          provider: process.env.AI_PROVIDER_GENERATE || "gemini",
+          error: message,
+          sceneId,
+        },
+      }).catch(() => {});
+    }
+
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

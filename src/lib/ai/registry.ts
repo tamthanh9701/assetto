@@ -22,9 +22,9 @@ function getProviderInstance(name: string): ImageAIProvider {
 
 function getConfig() {
   return {
-    generate: process.env.AI_PROVIDER_GENERATE || "replicate",
-    extract: process.env.AI_PROVIDER_EXTRACT || "replicate",
-    removebg: process.env.AI_PROVIDER_REMOVEBG || "replicate",
+    generate: process.env.AI_PROVIDER_GENERATE || "gemini",
+    extract: process.env.AI_PROVIDER_EXTRACT || "gemini",
+    removebg: process.env.AI_PROVIDER_REMOVEBG || "gemini",
   };
 }
 
