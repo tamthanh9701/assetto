@@ -1,17 +1,5 @@
 import { ImageAIProvider, SceneInput, GenResult, ExtractInput, LayerResult, BgInput, PngResult } from "../types";
 
-async function pollGeneration(url: string, apiKey: string, maxRetries = 60, interval = 1000): Promise<any> {
-  for (let i = 0; i < maxRetries; i++) {
-    const res = await fetch(url, {
-      headers: { "x-goog-api-key": apiKey },
-    });
-    const data = await res.json();
-    if (data.done) return data;
-    await new Promise((r) => setTimeout(r, interval));
-  }
-  throw new Error("Gemini generation timed out");
-}
-
 export class GeminiProvider implements ImageAIProvider {
   private apiKey: string;
 
@@ -29,7 +17,11 @@ export class GeminiProvider implements ImageAIProvider {
         body: JSON.stringify({
           contents: [
             {
-              parts: [{ text: `Generate a game UI scene: ${input.prompt}. Aspect ratio: ${input.ratio || "16:9"}` }],
+              parts: [
+                {
+                  text: `Generate a game UI scene: ${input.prompt}. Aspect ratio: ${input.ratio || "16:9"}`,
+                },
+              ],
             },
           ],
           generationConfig: {
@@ -39,6 +31,10 @@ export class GeminiProvider implements ImageAIProvider {
         }),
       }
     );
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`Gemini API error ${res.status}: ${errBody}`);
+    }
     const data = await res.json();
     const candidate = data?.candidates?.[0];
     const part = candidate?.content?.parts?.find((p: any) => p.inlineData);

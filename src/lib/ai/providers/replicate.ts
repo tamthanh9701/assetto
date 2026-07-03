@@ -1,17 +1,19 @@
 import { ImageAIProvider, SceneInput, GenResult, ExtractInput, LayerResult, BgInput, PngResult } from "../types";
 
-const MODEL_VERSIONS = {
-  "flux-schnell": "black-forest-labs/flux-schnell",
-  "flux-pro": "black-forest-labs/flux-pro",
-  sam2: "facebook/sam-2",
-  rembg: "cjwbw/rembg",
-} as const;
+const POLL_RETRIES = 120;
+const POLL_INTERVAL = 1000;
 
-async function pollPrediction(url: string, token: string, maxRetries = 60, interval = 1000): Promise<any> {
+async function pollPrediction(
+  url: string,
+  token: string,
+  maxRetries = POLL_RETRIES,
+  interval = POLL_INTERVAL
+): Promise<any> {
   for (let i = 0; i < maxRetries; i++) {
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
     });
+    if (!res.ok) throw new Error(`Poll failed: ${res.status}`);
     const data = await res.json();
     if (data.status === "succeeded") return data;
     if (data.status === "failed") throw new Error(`Replicate prediction failed: ${data.error}`);
@@ -19,6 +21,13 @@ async function pollPrediction(url: string, token: string, maxRetries = 60, inter
   }
   throw new Error("Replicate prediction timed out");
 }
+
+const MODEL_VERSIONS = {
+  "flux-schnell": "black-forest-labs/flux-schnell",
+  "flux-pro": "black-forest-labs/flux-pro",
+  sam2: "facebook/sam-2",
+  rembg: "cjwbw/rembg",
+} as const;
 
 export class ReplicateProvider implements ImageAIProvider {
   private apiToken: string;
@@ -47,6 +56,10 @@ export class ReplicateProvider implements ImageAIProvider {
         },
       }),
     });
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`Replicate API error ${res.status}: ${errBody}`);
+    }
     const data = await res.json();
     if (data.status === "succeeded") {
       return {
@@ -76,13 +89,17 @@ export class ReplicateProvider implements ImageAIProvider {
         input: { image: input.imageUrl },
       }),
     });
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`Replicate SAM error ${res.status}: ${errBody}`);
+    }
     const data = await res.json();
     const polled = await pollPrediction(data.urls?.get, this.apiToken);
     const maskUrl = Array.isArray(polled.output) ? polled.output[0] : polled.output;
-    const componentTypes = input.componentTypes ?? [
+    const types = input.componentTypes ?? [
       "BACKGROUND", "PANEL", "BUTTON", "ICON", "BADGE", "BAR",
     ];
-    const components = componentTypes.map((type, i) => ({
+    const components = types.map((type) => ({
       name: type.charAt(0) + type.slice(1).toLowerCase(),
       type,
       imageUrl: maskUrl,
@@ -104,6 +121,10 @@ export class ReplicateProvider implements ImageAIProvider {
         input: { image: input.imageUrl },
       }),
     });
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`Replicate rembg error ${res.status}: ${errBody}`);
+    }
     const data = await res.json();
     const polled = await pollPrediction(data.urls?.get, this.apiToken);
     return {
