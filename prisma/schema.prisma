@@ -1,0 +1,154 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum SceneType {
+  MENU
+  HUD
+  LOADING
+  SETTINGS
+  INVENTORY
+  SHOP
+  DIALOGUE
+  CUSTOM
+}
+
+enum ComponentGroupType {
+  BACKGROUND
+  PANEL
+  BUTTON
+  ICON
+  BAR
+  BADGE
+  CHARACTER
+  SPRITE
+  CUSTOM
+}
+
+enum AssetType {
+  SCENE
+  CHARACTER
+  ICON
+  SPRITE
+  COMPONENT
+}
+
+model User {
+  id        String    @id @default(cuid())
+  name      String?
+  email     String    @unique
+  password  String?
+  image     String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  projects  Project[]
+  accounts  Account[]
+  sessions  Session[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  palette     String?
+  artDirection String?
+  seed        Int?
+  referenceImageUrl String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scenes      Scene[]
+}
+
+model Scene {
+  id          String   @id @default(cuid())
+  prompt      String
+  type        SceneType @default(CUSTOM)
+  ratio       String   @default("16:9")
+  quality     String   @default("standard")
+  imageUrl    String?
+  styleRefUrl String?
+  seed        Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  componentGroups ComponentGroup[]
+  assets      Asset[]
+  generations Generation[]
+}
+
+model ComponentGroup {
+  id        String              @id @default(cuid())
+  name      String
+  type      ComponentGroupType  @default(CUSTOM)
+  order     Int                 @default(0)
+  sceneId   String
+  scene     Scene               @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  assets    Asset[]
+}
+
+model Asset {
+  id              String    @id @default(cuid())
+  name            String
+  type            AssetType @default(COMPONENT)
+  pngUrl          String?
+  maskUrl         String?
+  transparent     Boolean   @default(true)
+  width           Int?
+  height          Int?
+  order           Int       @default(0)
+  componentGroupId String?
+  componentGroup  ComponentGroup? @relation(fields: [componentGroupId], references: [id], onDelete: SetNull)
+  sceneId         String?
+  scene           Scene?    @relation(fields: [sceneId], references: [id], onDelete: SetNull)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+model Generation {
+  id        String   @id @default(cuid())
+  status    String   @default("pending")
+  provider  String
+  modelName String?
+  prompt    String?
+  resultUrl String?
+  error     String?
+  duration  Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  sceneId   String
+  scene     Scene    @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+}
