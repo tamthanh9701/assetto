@@ -25,6 +25,18 @@ interface SegmentationBox {
   label?: string;
 }
 
+function computeIoU(a: [number, number, number, number], b: [number, number, number, number]): number {
+  const ax1 = a[1], ay1 = a[0], ax2 = a[3], ay2 = a[2];
+  const bx1 = b[1], by1 = b[0], bx2 = b[3], by2 = b[2];
+  const ix1 = Math.max(ax1, bx1), iy1 = Math.max(ay1, by1);
+  const ix2 = Math.min(ax2, bx2), iy2 = Math.min(ay2, by2);
+  const iw = Math.max(0, ix2 - ix1), ih = Math.max(0, iy2 - iy1);
+  const inter = iw * ih;
+  const areaA = (ax2 - ax1) * (ay2 - ay1);
+  const areaB = (bx2 - bx1) * (by2 - by1);
+  return inter / (areaA + areaB - inter);
+}
+
 export class GeminiProvider implements ImageAIProvider {
   private apiKey: string;
 
@@ -140,24 +152,62 @@ Coordinates normalized 0-1000. Maximum 30 elements. No mask, no extra text.`;
 
     if (!Array.isArray(parsed)) parsed = [parsed];
 
-    // Deduplicate names: BUTTON_1, BUTTON_2, ...
-    const nameCounts: Record<string, number> = {};
-    const components = parsed
+    // Filter valid boxes
+    interface Box { box2d: [number, number, number, number]; label: string; area: number }
+    const boxes: Box[] = parsed
       .filter((s: any) => s.box_2d && Array.isArray(s.box_2d) && s.box_2d.length === 4 && s.label)
-      .map((s: any) => {
-        const baseType = s.label.toUpperCase();
-        nameCounts[baseType] = (nameCounts[baseType] || 0) + 1;
-        const suffix = nameCounts[baseType] > 1 ? `_${nameCounts[baseType]}` : "";
-        const name = baseType.charAt(0) + baseType.slice(1).toLowerCase() + suffix;
-        return {
-          name,
-          type: baseType,
-          imageUrl: "",
-          box2d: s.box_2d as [number, number, number, number],
-        };
-      });
+      .map((s: any) => ({
+        box2d: s.box_2d as [number, number, number, number],
+        label: s.label.toUpperCase(),
+        area: (s.box_2d[2] - s.box_2d[0]) * (s.box_2d[3] - s.box_2d[1]),
+      }));
 
-    console.log(`[extractLayers] ${components.length} elements detected: ${components.map((c: any) => c.name).join(", ")}`);
+    // NMS dedup: merge boxes with IoU > 0.6
+    const nmsed: Box[] = [];
+    boxes.sort((a, b) => b.area - a.area);
+    for (const box of boxes) {
+      let merged = false;
+      for (const kept of nmsed) {
+        const iou = computeIoU(box.box2d, kept.box2d);
+        if (iou > 0.6 || (box.label === kept.label && iou > 0.3)) {
+          kept.box2d = [
+            Math.min(box.box2d[0], kept.box2d[0]),
+            Math.min(box.box2d[1], kept.box2d[1]),
+            Math.max(box.box2d[2], kept.box2d[2]),
+            Math.max(box.box2d[3], kept.box2d[3]),
+          ] as [number, number, number, number];
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) nmsed.push({ ...box });
+    }
+
+    // Filter tiny boxes (<1.5% area), cap at 40
+    const filtered = nmsed
+      .filter((b) => b.area > 1.5 * 1.5)
+      .slice(0, 40);
+
+    // Sort by position (row-major), then name by grid position
+    const sorted = filtered.sort((a, b) => {
+      const rowDiff = a.box2d[0] - b.box2d[0];
+      return Math.abs(rowDiff) < 50 ? a.box2d[1] - b.box2d[1] : rowDiff;
+    });
+
+    const nameCounts: Record<string, number> = {};
+    const components = sorted.map((s, idx) => {
+      const baseType = s.label;
+      nameCounts[baseType] = (nameCounts[baseType] || 0) + 1;
+      const suffix = nameCounts[baseType] > 1 ? `_${nameCounts[baseType]}` : "";
+      return {
+        name: baseType.charAt(0) + baseType.slice(1).toLowerCase() + suffix,
+        type: baseType,
+        imageUrl: "",
+        box2d: s.box2d,
+      };
+    });
+
+    console.log(`[extractLayers] ${components.length} elements (from ${boxes.length} raw): ${components.map((c: any) => c.name).join(", ")}`);
     return { components };
   }
 
