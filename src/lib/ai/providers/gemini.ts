@@ -85,18 +85,14 @@ export class GeminiProvider implements ImageAIProvider {
   }
 
   async extractLayers(input: ExtractInput): Promise<LayerResult> {
-    const componentTypes = input.componentTypes ?? [
-      "BACKGROUND", "PANEL", "BUTTON", "ICON", "BADGE", "BAR",
-    ];
-
     const imgBuffer = await this.fetchImageForSegmentation(input.imageUrl);
     const base64Image = imgBuffer.toString("base64");
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
 
-    const prompt = `Segment this game UI image. Find each of these components: ${componentTypes.join(", ")}.
-Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"PANEL"}, ...].
-Coordinates normalized 0-1000. Omit types not found. No mask, no extra text.`;
+    const prompt = `Detect ALL individual UI elements in this game UI image (every icon, button, bar, badge, panel, avatar, text label, etc). Do NOT group by type — list each element separately.
+Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"BUTTON"},{"box_2d":[y1,x1,y2,x2],"label":"ICON"}, ...].
+Coordinates normalized 0-1000. Maximum 30 elements. No mask, no extra text.`;
 
     const res = await fetchWithRetry(url, {
       method: "POST",
@@ -125,7 +121,6 @@ Coordinates normalized 0-1000. Omit types not found. No mask, no extra text.`;
     const rawText = textPart.text.trim();
     console.log(`[extractLayers] raw length=${rawText.length}`);
 
-    // Parse flexibly: array or single object
     let parsed: any;
     try {
       const arrMatch = rawText.match(/\[[\s\S]*\]/);
@@ -134,8 +129,7 @@ Coordinates normalized 0-1000. Omit types not found. No mask, no extra text.`;
       } else {
         const objMatch = rawText.match(/\{[\s\S]*\}/);
         if (objMatch) {
-          const obj = JSON.parse(objMatch[0]);
-          parsed = [obj];
+          parsed = [JSON.parse(objMatch[0])];
         } else {
           throw new Error("No JSON found");
         }
@@ -146,17 +140,24 @@ Coordinates normalized 0-1000. Omit types not found. No mask, no extra text.`;
 
     if (!Array.isArray(parsed)) parsed = [parsed];
 
+    // Deduplicate names: BUTTON_1, BUTTON_2, ...
+    const nameCounts: Record<string, number> = {};
     const components = parsed
       .filter((s: any) => s.box_2d && Array.isArray(s.box_2d) && s.box_2d.length === 4 && s.label)
-      .map((s: any) => ({
-        name: s.label.toUpperCase().charAt(0) + s.label.slice(1).toLowerCase(),
-        type: s.label.toUpperCase(),
-        imageUrl: "",
-        maskUrl: "",
-        box2d: s.box_2d as [number, number, number, number],
-      }));
+      .map((s: any) => {
+        const baseType = s.label.toUpperCase();
+        nameCounts[baseType] = (nameCounts[baseType] || 0) + 1;
+        const suffix = nameCounts[baseType] > 1 ? `_${nameCounts[baseType]}` : "";
+        const name = baseType.charAt(0) + baseType.slice(1).toLowerCase() + suffix;
+        return {
+          name,
+          type: baseType,
+          imageUrl: "",
+          box2d: s.box_2d as [number, number, number, number],
+        };
+      });
 
-    console.log(`[extractLayers] ${components.length}/${componentTypes.length} components found`);
+    console.log(`[extractLayers] ${components.length} elements detected: ${components.map((c: any) => c.name).join(", ")}`);
     return { components };
   }
 
