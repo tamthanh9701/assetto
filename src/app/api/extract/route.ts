@@ -53,145 +53,65 @@ function chromaKey(raw: Buffer, w: number, h: number, tolerance: number): Buffer
   return Buffer.from(pixels);
 }
 
-// Radial split: create core (inside circle) and frame (ring between inner/outer radii)
-async function splitRadial(
-  cleanPng: Buffer,
-  w: number,
-  h: number,
-  label: string,
-  sceneId: string
-): Promise<{ coreUrl: string; frameUrl: string; plusUrl?: string }> {
-  const sharp = await import("sharp");
+async function segmentIconMask(cleanPng: Buffer, w: number, h: number): Promise<Buffer | null> {
+  try {
+    const sharp = await import("sharp");
+    const base64 = cleanPng.toString("base64");
+    const apiKey = process.env.GEMINI_API_KEY || "";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [
+          { text: "Return a segmentation mask (base64 PNG) covering ONLY the central icon symbol, EXCLUDING the round gold frame/border and background. JSON: {\"mask\":\"<base64 PNG>\", \"box_2d\":[y1,x1,y2,x2]}. Coordinates 0-1000. Return ONLY the JSON." },
+          { inlineData: { mimeType: "image/png", data: base64 } },
+        ]}],
+        generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: "application/json" },
+      }),
+    });
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    const textPart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
+    if (!textPart) return null;
+
+    const objMatch = textPart.text.trim().match(/\{[\s\S]*\}/);
+    if (!objMatch) return null;
+    const result = JSON.parse(objMatch[0]);
+    if (!result.mask) return null;
+
+    let maskB64 = result.mask;
+    if (maskB64.includes("base64,")) maskB64 = maskB64.split("base64,")[1];
+
+    const maskBuffer = Buffer.from(maskB64, "base64");
+    const resized = await sharp.default(maskBuffer)
+      .resize(w, h, { fit: "fill" })
+      .grayscale()
+      .threshold(128)
+      .raw()
+      .toBuffer();
+
+    return Buffer.from(resized);
+  } catch {
+    return null;
+  }
+}
+
+async function radialMask(w: number, h: number): Promise<Buffer> {
   const cx = w / 2;
   const cy = h / 2;
   const R = Math.min(w, h) / 2;
-  const innerR = 0.60 * R;
-  const outerR = 0.98 * R;
-
-  const raw = await sharp.default(cleanPng).ensureAlpha().raw().toBuffer();
-  const pixels = new Uint8Array(raw);
-  const bpp = 4;
-
-  // Core: keep pixels inside inner circle, rest alpha=0
-  const corePixels = new Uint8Array(raw);
+  const innerR = 0.58 * R;
+  const mask = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const dx = x - cx, dy = y - cy;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      const pi = (y * w + x) * bpp;
-      if (dist > innerR) {
-        corePixels[pi + 3] = 0;
-      }
+      if (Math.sqrt(dx * dx + dy * dy) < innerR) mask[y * w + x] = 255;
     }
   }
-  const coreBuffer = await sharp.default(corePixels, { raw: { width: w, height: h, channels: 4 } }).trim().png().toBuffer();
-  const coreUrl = await persistImage(`data:image/png;base64,${coreBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
-
-  // Frame: keep ring between innerR and outerR, rest alpha=0 (punch inner + discard corners)
-  const framePixels = new Uint8Array(raw);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const dx = x - cx, dy = y - cy;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      const pi = (y * w + x) * bpp;
-      if (dist < innerR || dist > outerR) {
-        framePixels[pi + 3] = 0;
-      }
-    }
-  }
-  const frameBuffer = await sharp.default(framePixels, { raw: { width: w, height: h, channels: 4 } }).trim().png().toBuffer();
-  const frameUrl = await persistImage(`data:image/png;base64,${frameBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
-
-  // Plus badge detection: look for red pixels in top-right quadrant
-  let plusUrl: string | undefined;
-  const qw = Math.round(w * 0.35);
-  const qh = Math.round(h * 0.35);
-  let hasRed = false;
-  for (let y = 0; y < qh && y < h; y++) {
-    for (let x = w - qw; x < w; x++) {
-      const pi = (y * w + x) * bpp;
-      const r = pixels[pi], g = pixels[pi + 1], b = pixels[pi + 2], a = pixels[pi + 3];
-      if (a > 128 && r > 180 && g < 100 && b < 100) { hasRed = true; break; }
-    }
-    if (hasRed) break;
-  }
-  if (hasRed) {
-    // Extract plus badge area from clean crop, chroma-key it
-    const plusRaw = await sharp.default(cleanPng)
-      .extract({ left: w - qw, top: 0, width: qw, height: qh })
-      .ensureAlpha()
-      .raw()
-      .toBuffer();
-    const plusKeyed = chromaKey(plusRaw, qw, qh, 28);
-    const plusBuffer = await sharp.default(plusKeyed, { raw: { width: qw, height: qh, channels: 4 } }).trim().png().toBuffer();
-    plusUrl = await persistImage(`data:image/png;base64,${plusBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_plus`);
-
-    // Punch plus badge out of frame
-    // Create transparent rectangle over the badge area on the frame
-    const punchOut = await sharp.default({
-      create: { width: qw, height: qh, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
-    }).png().toBuffer();
-    const frameFixed = await sharp.default(frameBuffer)
-      .composite([{ input: punchOut, left: w - qw, top: 0 }])
-      .png()
-      .toBuffer();
-    const frameFixedUrl = await persistImage(`data:image/png;base64,${frameFixed.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
-    return { coreUrl, frameUrl: frameFixedUrl, plusUrl };
-  }
-
-  return { coreUrl, frameUrl };
-}
-
-// AI-guided split: crop inner_icon box from Gemini, punch from frame
-async function splitByAI(
-  cleanPng: Buffer,
-  w: number,
-  h: number,
-  label: string,
-  sceneId: string
-): Promise<{ coreUrl?: string; frameUrl?: string; plusUrl?: string }> {
-  const sharp = await import("sharp");
-  const base64 = cleanPng.toString("base64");
-  const SEGMENTATION_MODEL = "gemini-2.5-flash";
-  const apiKey = process.env.GEMINI_API_KEY || "";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${apiKey}`;
-
-  const res = await fetch(url, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: "Return JSON {\"inner_icon\":[y1,x1,y2,x2] or null}. Coords 0-1000. inner_icon = the central symbol/label of this UI element, excluding frame/border." }, { inlineData: { mimeType: "image/png", data: base64 } }] }],
-      generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: "application/json" },
-    }),
-  });
-  if (!res.ok) return {};
-  const data = await res.json();
-  const textPart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
-  if (!textPart) return {};
-  const objMatch = textPart.text.trim().match(/\{[\s\S]*\}/);
-  if (!objMatch) return {};
-  const result = JSON.parse(objMatch[0]);
-  const box = result.inner_icon;
-  if (!box || box.length !== 4) return {};
-
-  const [sy1, sx1, sy2, sx2] = box;
-  const sl = clamp(Math.round((sx1 / 1000) * w), 0, w - 1);
-  const st = clamp(Math.round((sy1 / 1000) * h), 0, h - 1);
-  const cw = clamp(Math.round(((sx2 - sx1) / 1000) * w), 1, w - sl);
-  const ch = clamp(Math.round(((sy2 - sy1) / 1000) * h), 1, h - st);
-
-  const iconBuffer = await sharp.default(cleanPng).extract({ left: sl, top: st, width: cw, height: ch }).png().toBuffer();
-  const coreUrl = await persistImage(`data:image/png;base64,${iconBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
-
-  const punchOut = await sharp.default({ create: { width: cw, height: ch, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).png().toBuffer();
-  const frameBuffer = await sharp.default(cleanPng).composite([{ input: punchOut, left: sl, top: st }]).png().toBuffer();
-  const frameUrl = await persistImage(`data:image/png;base64,${frameBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
-
-  return { coreUrl, frameUrl };
-}
-
-function isRound(w: number, h: number): boolean {
-  const ratio = w / h;
-  return ratio >= 0.85 && ratio <= 1.18;
+  return Buffer.from(mask);
 }
 
 export async function POST(req: Request) {
@@ -202,9 +122,7 @@ export async function POST(req: Request) {
     const { sceneId, imageUrl } = await req.json();
     if (!sceneId || !imageUrl) return NextResponse.json({ error: "sceneId and imageUrl required" }, { status: 400 });
 
-    const scene = await prisma.scene.findFirst({
-      where: { id: sceneId, project: { userId: session.user.id } },
-    });
+    const scene = await prisma.scene.findFirst({ where: { id: sceneId, project: { userId: session.user.id } } });
     if (!scene) return NextResponse.json({ error: "Scene not found" }, { status: 404 });
 
     const imgRes = await fetch(imageUrl);
@@ -229,7 +147,7 @@ export async function POST(req: Request) {
         batch.map(async (seg) => {
           const label = seg.name;
           const type = seg.type;
-          const isBg = type === "BACKGROUND";
+          const isIconButton = type.startsWith("ICON") || type.startsWith("BUTTON") || type.startsWith("BADGE");
 
           if (!seg.box2d) {
             const pngUrl = await persistImage(imageUrl, `comp_${sceneId.slice(0, 6)}_${label}`);
@@ -247,27 +165,66 @@ export async function POST(req: Request) {
           let cropBuffer = await sharp.default(imgBuffer).extract({ left, top, width: cw, height: ch }).ensureAlpha().raw().toBuffer();
           cropBuffer = Buffer.from(chromaKey(cropBuffer, cw, ch, 28));
           const cleanPng = await sharp.default(cropBuffer, { raw: { width: cw, height: ch, channels: 4 } }).trim().png().toBuffer();
+          const trimMeta = await sharp.default(cleanPng).metadata();
+          const tw = trimMeta.width || cw;
+          const th = trimMeta.height || ch;
 
           const group = await getOrCreateGroup(sceneId, type, batchStart + batch.indexOf(seg));
           const assets: any[] = [];
 
-          // Hybrid: round → radial split, non-round → AI split
-          const isRoundElement = isRound(cw, ch) && (type.startsWith("ICON") || type.startsWith("BUTTON") || type.startsWith("BADGE"));
+          if (isIconButton) {
+            // Per-pixel mask via Gemini segmentation
+            const mask = await segmentIconMask(cleanPng, tw, th);
+            const isAI = mask !== null;
+            const alphaMask = mask || (await radialMask(tw, th));
 
-          if (isRoundElement) {
-            const sub = await splitRadial(cleanPng, cw, ch, label, sceneId);
-            for (const [subType, url] of Object.entries({ core: sub.coreUrl, frame: sub.frameUrl, plus: sub.plusUrl })) {
-              if (!url) continue;
-              const asset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_${subType}`, type: group.type as any, subType, pngUrl: url, transparent: true, componentGroupId: group.id, sceneId } });
-              assets.push(asset);
+            if (!isAI) console.warn(`[extract] ${label}: mask from AI failed, fallback to radial`);
+
+            // Core: apply mask as alpha
+            const rawPixels = await sharp.default(cleanPng).ensureAlpha().raw().toBuffer();
+            const pixels = new Uint8Array(rawPixels);
+            const bpp = 4;
+            let coreTransparent = 0;
+            let coreTotal = 0;
+            for (let y = 0; y < th; y++) {
+              for (let x = 0; x < tw; x++) {
+                const pi = (y * tw + x) * bpp;
+                const mi = y * tw + x;
+                if (alphaMask[mi] < 128) {
+                  pixels[pi + 3] = 0;
+                  coreTransparent++;
+                }
+                coreTotal++;
+              }
             }
-          } else if (type.startsWith("ICON") || type.startsWith("BUTTON") || type.startsWith("BADGE")) {
-            const sub = await splitByAI(cleanPng, cw, ch, label, sceneId);
-            for (const [subType, url] of Object.entries({ core: sub.coreUrl, frame: sub.frameUrl, plus: sub.plusUrl })) {
-              if (!url) continue;
-              const asset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_${subType}`, type: group.type as any, subType, pngUrl: url, transparent: true, componentGroupId: group.id, sceneId } });
-              assets.push(asset);
+            const coreBuffer = await sharp.default(pixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
+            const coreUrl = await persistImage(`data:image/png;base64,${coreBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
+
+            // Frame: punch out mask pixels
+            const framePixels = new Uint8Array(rawPixels);
+            let frameTransparent = 0;
+            let frameTotal = 0;
+            for (let y = 0; y < th; y++) {
+              for (let x = 0; x < tw; x++) {
+                const pi = (y * tw + x) * bpp;
+                const mi = y * tw + x;
+                if (alphaMask[mi] >= 128) {
+                  framePixels[pi + 3] = 0;
+                  frameTransparent++;
+                }
+                frameTotal++;
+              }
             }
+            const frameBuffer = await sharp.default(framePixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
+            const frameUrl = await persistImage(`data:image/png;base64,${frameBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
+
+            const corePct = ((coreTransparent / coreTotal) * 100).toFixed(1);
+            const framePct = ((frameTransparent / frameTotal) * 100).toFixed(1);
+            console.log(`[extract] ${label}: core_transparent=${corePct}% frame_transparent=${framePct}% method=${isAI ? "AI" : "radial"}`);
+
+            const coreAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_core`, type: group.type as any, subType: "core", pngUrl: coreUrl, transparent: true, componentGroupId: group.id, sceneId } });
+            const frameAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_frame`, type: group.type as any, subType: "frame", pngUrl: frameUrl, transparent: true, componentGroupId: group.id, sceneId } });
+            assets.push(coreAsset, frameAsset);
           }
 
           const mainPngUrl = await persistImage(`data:image/png;base64,${cleanPng.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}`);
