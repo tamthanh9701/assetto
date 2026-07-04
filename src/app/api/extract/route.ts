@@ -2,66 +2,12 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { getProvider } from "@/lib/ai/registry";
-import { persistImage, persistBase64Image } from "@/lib/storage";
+import { persistImage } from "@/lib/storage";
 
 export const maxDuration = 120;
 
-async function fetchBuffer(url: string): Promise<Buffer> {
-  if (url.startsWith("data:")) {
-    const matches = url.match(/^data:image\/\w+;base64,(.+)$/);
-    if (!matches) throw new Error("Invalid data URL");
-    return Buffer.from(matches[1], "base64");
-  }
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch: ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
-}
-
-async function extractComponentWithMask(
-  imageUrl: string,
-  maskUrl: string,
-  label: string,
-  sceneId: string
-): Promise<string> {
-  try {
-    const sharp = await import("sharp");
-    const [imgBuffer, maskBuffer] = await Promise.all([
-      fetchBuffer(imageUrl),
-      fetchBuffer(maskUrl),
-    ]);
-
-    const imgMeta = await sharp.default(imgBuffer).metadata();
-    const w = imgMeta.width || 1024;
-    const h = imgMeta.height || 576;
-
-    // Get binary alpha channel from mask
-    const alphaRaw = await sharp.default(maskBuffer)
-      .resize(w, h, { fit: "fill" })
-      .grayscale()
-      .threshold(128)
-      .raw()
-      .toBuffer();
-
-    // Apply as alpha channel — removeAlpha ensures RGB, joinChannel adds alpha with raw option
-    const extracted = await sharp.default(imgBuffer)
-      .removeAlpha()
-      .joinChannel(alphaRaw, { raw: { width: w, height: h, channels: 1 } })
-      .png()
-      .toBuffer();
-
-    const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
-    if (blobToken) {
-      const { put } = await import("@vercel/blob");
-      const filename = `comp_${sceneId.slice(0, 6)}_${label}_${Date.now()}.png`;
-      const result = await put(filename, extracted, { access: "public" });
-      return result.url;
-    }
-
-    return `data:image/png;base64,${extracted.toString("base64")}`;
-  } catch (e) {
-    console.warn(`[extractComponentWithMask] fallback for ${label}:`, e);
-    return imageUrl;
-  }
+function clamp(v: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, v));
 }
 
 export async function POST(req: Request) {
@@ -81,48 +27,52 @@ export async function POST(req: Request) {
     });
     if (!scene) return NextResponse.json({ error: "Scene not found" }, { status: 404 });
 
+    // Fetch source image
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) throw new Error(`Failed to fetch source image: ${imgRes.status}`);
+    const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
+
+    const sharp = await import("sharp");
+    const imgMeta = await sharp.default(imgBuffer).metadata();
+    const W = imgMeta.width || 1024;
+    const H = imgMeta.height || 576;
+
     const componentTypes = ["BACKGROUND", "PANEL", "BUTTON", "ICON", "BADGE", "BAR"];
 
-    // Segmentation
+    // 1 call segmentation — box only
     const provider = getProvider("extract");
     const segmentResult = await provider.extractLayers({ imageUrl, componentTypes });
 
-    // Remove-bg fallback
-    const bgProvider = getProvider("removebg");
-    let transparentBgUrl = imageUrl;
-    try {
-      const removed = await bgProvider.removeBackground({ imageUrl });
-      if (removed.imageUrl) transparentBgUrl = removed.imageUrl;
-    } catch (e) {
-      console.warn("[extract] remove-bg fallback failed:", e);
-    }
-
-    const components = await Promise.all(
+    // Crop each component by box
+    const results = await Promise.allSettled(
       componentTypes.map(async (type, i) => {
         const label = type.charAt(0) + type.slice(1).toLowerCase();
-        const existing = segmentResult.components.find(
+        const seg = segmentResult.components.find(
           (c) => c.type === type || c.name === label
         );
 
         let pngUrl: string;
-        let maskUrl = existing?.maskUrl || "";
 
-        if (existing?.maskUrl) {
-          pngUrl = await extractComponentWithMask(imageUrl, existing.maskUrl, label, sceneId);
+        if (seg?.box2d) {
+          const [y1, x1, y2, x2] = seg.box2d;
+          const left = clamp(Math.round((x1 / 1000) * W), 0, W - 1);
+          const top = clamp(Math.round((y1 / 1000) * H), 0, H - 1);
+          const width = clamp(Math.round(((x2 - x1) / 1000) * W), 1, W - left);
+          const height = clamp(Math.round(((y2 - y1) / 1000) * H), 1, H - top);
+
+          const crop = await sharp.default(imgBuffer)
+            .extract({ left, top, width, height })
+            .png()
+            .toBuffer();
+
+          pngUrl = await persistImage(
+            `data:image/png;base64,${crop.toString("base64")}`,
+            `comp_${sceneId.slice(0, 6)}_${label}`
+          );
         } else {
-          pngUrl = transparentBgUrl;
+          // No box found — crop full image
+          pngUrl = await persistImage(imageUrl, `comp_${sceneId.slice(0, 6)}_${label}`);
         }
-
-        const isDataUrl = pngUrl.startsWith("data:");
-        const permanentUrl = isDataUrl
-          ? await persistBase64Image(pngUrl, `comp_${sceneId.slice(0, 6)}_${label}`)
-          : await persistImage(pngUrl, `comp_${sceneId.slice(0, 6)}_${label}`);
-
-        const permMask = maskUrl
-          ? (maskUrl.startsWith("data:")
-            ? await persistBase64Image(maskUrl, `mask_${sceneId.slice(0, 6)}_${label}`)
-            : await persistImage(maskUrl, `mask_${sceneId.slice(0, 6)}_${label}`))
-          : "";
 
         const group = await prisma.componentGroup.create({
           data: { name: label, type: type as any, order: i, sceneId },
@@ -132,17 +82,22 @@ export async function POST(req: Request) {
           data: {
             name: `${label}_${sceneId.slice(0, 6)}`,
             type: "COMPONENT",
-            pngUrl: permanentUrl,
-            maskUrl: permMask,
-            transparent: true,
+            pngUrl,
+            transparent: false,
             componentGroupId: group.id,
             sceneId,
           },
         });
 
-        return { name: group.name, type: group.type, imageUrl: asset.pngUrl, maskUrl: asset.maskUrl };
+        return { name: group.name, type: group.type, imageUrl: asset.pngUrl };
       })
     );
+
+    const components = results
+      .filter((r) => r.status === "fulfilled")
+      .map((r: any) => r.value);
+
+    console.log(`[extract] ${components.length}/${componentTypes.length} components extracted`);
 
     return NextResponse.json({ components });
   } catch (err) {

@@ -24,6 +24,7 @@ export interface LayerResult {
     type: string;
     imageUrl: string;
     maskUrl?: string;
+    box2d?: [number, number, number, number];
   }[];
 }
 
