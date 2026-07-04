@@ -124,6 +124,7 @@ model Asset {
   id              String    @id @default(cuid())
   name            String
   type            AssetType @default(COMPONENT)
+  subType         String?
   pngUrl          String?
   maskUrl         String?
   transparent     Boolean   @default(true)

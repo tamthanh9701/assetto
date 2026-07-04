@@ -11,22 +11,18 @@ function clamp(v: number, min: number, max: number): number {
 }
 
 interface Rgba {
-  r: number;
-  g: number;
-  b: number;
-  a: number;
+  r: number; g: number; b: number; a: number;
 }
 
 function colorDist(a: Rgba, b: Rgba): number {
   return Math.sqrt((a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2);
 }
 
-function chromaKey(raw: Buffer, w: number, h: number, tolerance: number): Uint8Array {
+function chromaKey(raw: Buffer, w: number, h: number, tolerance: number): Buffer {
   const pixels = new Uint8Array(raw);
   const bpp = 4;
   const stride = w * bpp;
 
-  // Estimate background color from corners
   const corners: Rgba[] = [
     { r: pixels[0], g: pixels[1], b: pixels[2], a: pixels[3] },
     { r: pixels[(w - 1) * bpp], g: pixels[(w - 1) * bpp + 1], b: pixels[(w - 1) * bpp + 2], a: pixels[(w - 1) * bpp + 3] },
@@ -40,32 +36,22 @@ function chromaKey(raw: Buffer, w: number, h: number, tolerance: number): Uint8A
     a: 255,
   };
 
-  // BFS flood-fill from edge pixels
   const visited = new Uint8Array(w * h);
   const queue: number[] = [];
   const idx = (x: number, y: number) => y * w + x;
 
-  // Push all edge pixels
-  for (let x = 0; x < w; x++) {
-    queue.push(idx(x, 0), idx(x, h - 1));
-  }
-  for (let y = 0; y < h; y++) {
-    queue.push(idx(0, y), idx(w - 1, y));
-  }
+  for (let x = 0; x < w; x++) { queue.push(idx(x, 0), idx(x, h - 1)); }
+  for (let y = 0; y < h; y++) { queue.push(idx(0, y), idx(w - 1, y)); }
 
   let qi = 0;
   while (qi < queue.length) {
     const i = queue[qi++];
     if (visited[i]) continue;
     visited[i] = 1;
-
     const pi = i * bpp;
     const px: Rgba = { r: pixels[pi], g: pixels[pi + 1], b: pixels[pi + 2], a: pixels[pi + 3] };
     if (colorDist(px, bgColor) > tolerance) continue;
-
-    // Set alpha to 0
     pixels[pi + 3] = 0;
-
     const x = i % w;
     const y = Math.floor(i / w);
     if (x > 0) queue.push(i - 1);
@@ -73,8 +59,50 @@ function chromaKey(raw: Buffer, w: number, h: number, tolerance: number): Uint8A
     if (y > 0) queue.push(i - w);
     if (y < h - 1) queue.push(i + w);
   }
+  return Buffer.from(pixels);
+}
 
-  return new Uint8Array(pixels);
+async function segmentSubElement(
+  cropBuffer: Buffer,
+  label: string
+): Promise<{ innerIcon?: [number, number, number, number]; plusBadge?: [number, number, number, number] }> {
+  try {
+    const base64 = cropBuffer.toString("base64");
+    const SEGMENTATION_MODEL = "gemini-2.5-flash";
+    const apiKey = process.env.GEMINI_API_KEY || "";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${apiKey}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              { text: "In this UI element image, return JSON: {\"inner_icon\":[y1,x1,y2,x2], \"plus_badge\":[y1,x1,y2,x2] or null}. Coords 0-1000 relative to THIS image. inner_icon = the central symbol only, excluding the round frame/border." },
+              { inlineData: { mimeType: "image/png", data: base64 } },
+            ],
+          },
+        ],
+        generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: "application/json" },
+      }),
+    });
+
+    if (!res.ok) return {};
+    const data = await res.json();
+    const textPart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
+    if (!textPart) return {};
+
+    const objMatch = textPart.text.trim().match(/\{[\s\S]*\}/);
+    if (!objMatch) return {};
+    const result = JSON.parse(objMatch[0]);
+    return {
+      innerIcon: result.inner_icon?.length === 4 ? result.inner_icon : undefined,
+      plusBadge: result.plus_badge?.length === 4 ? result.plus_badge : undefined,
+    };
+  } catch {
+    return {};
+  }
 }
 
 export async function POST(req: Request) {
@@ -107,15 +135,28 @@ export async function POST(req: Request) {
     const segmentResult = await provider.extractLayers({ imageUrl });
     const allElements = segmentResult.components;
 
-    const results = await Promise.allSettled(
-      allElements.map(async (seg, i) => {
-        const label = seg.name;
-        const type = seg.type;
-        const isBackground = type === "BACKGROUND";
+    // Limit concurrent sub-segmentation calls
+    const CONCURRENCY = 5;
+    const results: any[] = [];
 
-        let pngUrl: string;
+    for (let batchStart = 0; batchStart < allElements.length; batchStart += CONCURRENCY) {
+      const batch = allElements.slice(batchStart, batchStart + CONCURRENCY);
+      const batchResults = await Promise.allSettled(
+        batch.map(async (seg) => {
+          const label = seg.name;
+          const type = seg.type;
+          const isBackground = type === "BACKGROUND";
+          const needsSubSeg = type.startsWith("ICON") || type.startsWith("BUTTON") || type.startsWith("BADGE");
 
-        if (seg.box2d) {
+          if (!seg.box2d) {
+            const pngUrl = await persistImage(imageUrl, `comp_${sceneId.slice(0, 6)}_${label}`);
+            const group = await getOrCreateGroup(sceneId, type, 0);
+            const asset = await prisma.asset.create({
+              data: { name: `${label}_${sceneId.slice(0, 6)}`, type: group.type as any, pngUrl, transparent: true, componentGroupId: group.id, sceneId },
+            });
+            return { name: label, type: group.type, imageUrl: asset.pngUrl, assets: [asset] };
+          }
+
           const [y1, x1, y2, x2] = seg.box2d;
           const left = clamp(Math.round((x1 / 1000) * W), 0, W - 1);
           const top = clamp(Math.round((y1 / 1000) * H), 0, H - 1);
@@ -128,72 +169,150 @@ export async function POST(req: Request) {
             .raw()
             .toBuffer();
 
-          // Chroma-key for non-background components
-          if (!isBackground) {
-            const keyed = chromaKey(cropBuffer, width, height, 28);
-            cropBuffer = Buffer.from(keyed);
-            cropBuffer = await sharp.default(cropBuffer, { raw: { width, height, channels: 4 } })
-              .trim()
-              .png()
-              .toBuffer();
-          } else {
-            cropBuffer = await sharp.default(cropBuffer, { raw: { width, height, channels: 4 } })
-              .png()
-              .toBuffer();
+          // Chroma-key
+          cropBuffer = Buffer.from(chromaKey(cropBuffer, width, height, 28));
+          const cleanPng = await sharp.default(cropBuffer, { raw: { width, height, channels: 4 } })
+            .trim()
+            .png()
+            .toBuffer();
+
+          const group = await getOrCreateGroup(sceneId, type, batchStart + batch.indexOf(seg));
+
+          // Sub-segmentation for icons/buttons/badges
+          let assets: any[] = [];
+          if (needsSubSeg) {
+            const sub = await segmentSubElement(cleanPng, label);
+            const subResults: any[] = [];
+
+            if (sub.innerIcon) {
+              const [sy1, sx1, sy2, sx2] = sub.innerIcon;
+              const sw = Math.round(((sx2 - sx1) / 1000) * width);
+              const sh = Math.round(((sy2 - sy1) / 1000) * height);
+              const sl = clamp(Math.round((sx1 / 1000) * width), 0, width - 1);
+              const st = clamp(Math.round((sy1 / 1000) * height), 0, height - 1);
+              const cw = clamp(sw, 1, width - sl);
+              const ch = clamp(sh, 1, height - st);
+
+              const iconBuffer = await sharp.default(cleanPng)
+                .extract({ left: sl, top: st, width: cw, height: ch })
+                .png()
+                .toBuffer();
+
+              const iconUrl = await persistImage(`data:image/png;base64,${iconBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
+              subResults.push({ subType: "core", pngUrl: iconUrl });
+            }
+
+            // Frame: punch out inner_icon area
+            if (sub.innerIcon) {
+              const [sy1, sx1, sy2, sx2] = sub.innerIcon;
+              const sw = Math.round(((sx2 - sx1) / 1000) * width);
+              const sh = Math.round(((sy2 - sy1) / 1000) * height);
+              const sl = clamp(Math.round((sx1 / 1000) * width), 0, width - 1);
+              const st = clamp(Math.round((sy1 / 1000) * height), 0, height - 1);
+              const cw = clamp(sw, 1, width - sl);
+              const ch = clamp(sh, 1, height - st);
+
+              // Create a black rectangle to punch out
+              const punchOut = await sharp.default({
+                create: { width: cw, height: ch, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+              }).png().toBuffer();
+
+              const frameBuffer = await sharp.default(cleanPng)
+                .composite([{ input: punchOut, left: sl, top: st }])
+                .png()
+                .toBuffer();
+
+              const frameUrl = await persistImage(`data:image/png;base64,${frameBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
+              subResults.push({ subType: "frame", pngUrl: frameUrl });
+            }
+
+            if (sub.plusBadge) {
+              const [py1, px1, py2, px2] = sub.plusBadge;
+              const pw = Math.round(((px2 - px1) / 1000) * width);
+              const ph = Math.round(((py2 - py1) / 1000) * height);
+              const pl = clamp(Math.round((px1 / 1000) * width), 0, width - 1);
+              const pt = clamp(Math.round((py1 / 1000) * height), 0, height - 1);
+              const cw = clamp(pw, 1, width - pl);
+              const ch = clamp(ph, 1, height - pt);
+
+              const badgeBuffer = await sharp.default(cleanPng)
+                .extract({ left: pl, top: pt, width: cw, height: ch })
+                .png()
+                .toBuffer();
+
+              const badgeUrl = await persistImage(`data:image/png;base64,${badgeBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_plus`);
+              subResults.push({ subType: "plus", pngUrl: badgeUrl });
+            }
+
+            // Create assets for sub-results
+            for (const sr of subResults) {
+              const asset = await prisma.asset.create({
+                data: {
+                  name: `${label}_${sceneId.slice(0, 6)}_${sr.subType}`,
+                  type: group.type as any,
+                  subType: sr.subType,
+                  pngUrl: sr.pngUrl,
+                  transparent: true,
+                  componentGroupId: group.id,
+                  sceneId,
+                },
+              });
+              assets.push(asset);
+            }
           }
 
-          pngUrl = await persistImage(
-            `data:image/png;base64,${cropBuffer.toString("base64")}`,
-            `comp_${sceneId.slice(0, 6)}_${label}`
-          );
-        } else {
-          pngUrl = await persistImage(imageUrl, `comp_${sceneId.slice(0, 6)}_${label}`);
-        }
-
-        // Group by type
-        const groupType = type === "BACKGROUND" ? "BACKGROUND"
-          : type === "PANEL" ? "PANEL"
-          : type.startsWith("BUTTON") ? "BUTTON"
-          : type.startsWith("ICON") ? "ICON"
-          : type.startsWith("BAR") ? "BAR"
-          : type.startsWith("BADGE") ? "BADGE"
-          : "CUSTOM";
-
-        let group = await prisma.componentGroup.findFirst({
-          where: { sceneId, type: groupType as any },
-        });
-
-        if (!group) {
-          group = await prisma.componentGroup.create({
-            data: { name: groupType.charAt(0) + groupType.slice(1).toLowerCase(), type: groupType as any, order: i, sceneId },
+          // Create main asset (the whole crop)
+          const mainPngUrl = await persistImage(`data:image/png;base64,${cleanPng.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}`);
+          const mainAsset = await prisma.asset.create({
+            data: {
+              name: `${label}_${sceneId.slice(0, 6)}`,
+              type: group.type as any,
+              pngUrl: mainPngUrl,
+              transparent: true,
+              componentGroupId: group.id,
+              sceneId,
+            },
           });
-        }
+          assets.push(mainAsset);
 
-        const asset = await prisma.asset.create({
-          data: {
-            name: `${label}_${sceneId.slice(0, 6)}`,
-            type: groupType as any,
-            pngUrl,
-            transparent: !isBackground,
-            componentGroupId: group.id,
-            sceneId,
-          },
-        });
+          return { name: label, type: group.type, imageUrl: mainPngUrl, assets };
+        })
+      );
 
-        return { name: group.name, type: group.type, imageUrl: asset.pngUrl };
-      })
-    );
+      for (const r of batchResults) {
+        if (r.status === "fulfilled") results.push(r.value);
+        else console.warn("[extract] batch element failed:", r.reason);
+      }
+    }
 
-    const components = results
-      .filter((r) => r.status === "fulfilled")
-      .map((r: any) => r.value);
+    console.log(`[extract] ${results.length} components extracted`);
 
-    console.log(`[extract] ${components.length} components extracted`);
-
-    return NextResponse.json({ components });
+    return NextResponse.json({ components: results.map((r) => ({ name: r.name, type: r.type, imageUrl: r.imageUrl })) });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error("Extract error:", message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+async function getOrCreateGroup(sceneId: string, type: string, order: number) {
+  const groupType = type === "BACKGROUND" ? "BACKGROUND"
+    : type === "PANEL" ? "PANEL"
+    : type.startsWith("BUTTON") ? "BUTTON"
+    : type.startsWith("ICON") ? "ICON"
+    : type.startsWith("BAR") ? "BAR"
+    : type.startsWith("BADGE") ? "BADGE"
+    : "CUSTOM";
+
+  let group = await prisma.componentGroup.findFirst({
+    where: { sceneId, type: groupType as any },
+  });
+
+  if (!group) {
+    group = await prisma.componentGroup.create({
+      data: { name: groupType.charAt(0) + groupType.slice(1).toLowerCase(), type: groupType as any, order, sceneId },
+    });
+  }
+
+  return group;
 }
