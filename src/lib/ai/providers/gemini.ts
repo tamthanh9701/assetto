@@ -85,109 +85,145 @@ export class GeminiProvider implements ImageAIProvider {
   }
 
   async extractLayers(input: ExtractInput): Promise<LayerResult> {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
-
     const componentTypes = input.componentTypes ?? [
       "BACKGROUND", "PANEL", "BUTTON", "ICON", "BADGE", "BAR",
     ];
 
-    const prompt = `Segment this game UI image. For each of these component types: ${componentTypes.join(", ")}, return the bounding box and mask.
-
-Return a JSON array with objects like: {"box_2d": [y1, x1, y2, x2], "label": "PANEL", "mask": "<base64 PNG grayscale mask>"}
-
-Coordinates are normalized to 0–1000. The mask is a grayscale PNG base64 string where white=keep, black=discard.
-If a component type is not found, omit it from the array.
-Return ONLY the JSON array, no other text.`;
-
     const imgBuffer = await this.fetchImageForSegmentation(input.imageUrl);
     const base64Image = imgBuffer.toString("base64");
-
-    const res = await fetchWithRetry(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: "image/png", data: base64Image } },
-            ],
-          },
-        ],
-        generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 } },
-      }),
-    });
-
-    if (!res.ok) {
-      const errBody = await res.text();
-      throw new Error(`Gemini segmentation error ${res.status}: ${errBody}`);
-    }
-
-    const data = await res.json();
-    const candidate = data?.candidates?.[0];
-    if (!candidate) throw new Error("Gemini segmentation: no candidate");
-    const textPart = candidate?.content?.parts?.find((p: any) => p.text);
-    if (!textPart) throw new Error("Gemini segmentation: no text response");
-
-    const text = textPart.text.trim();
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) throw new Error(`Gemini segmentation: no JSON found. Got: ${text.slice(0, 200)}`);
-    const segments: SegmentationBox[] = JSON.parse(jsonMatch[0]);
-
     const sharp = await import("sharp");
     const imgMeta = await sharp.default(imgBuffer).metadata();
     const canvasW = imgMeta.width || 1024;
     const canvasH = imgMeta.height || 576;
 
-    const components = await Promise.all(
-      segments.map(async (seg) => {
-        const label = seg.label?.toUpperCase() || "CUSTOM";
-        if (!seg.mask) return { name: label, type: label, imageUrl: "", maskUrl: "" };
+    // Tách 1 call / component, chạy song song
+    const results = await Promise.all(
+      componentTypes.map(async (type, _i) => {
+        const label = type.charAt(0) + type.slice(1).toLowerCase();
+        try {
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
 
-        const maskData = Buffer.from(seg.mask, "base64");
-        let maskCanvas: Buffer;
+          const prompt = `Segment this game UI image and find the "${label}" component. Return a JSON object:
+{"box_2d": [y1, x1, y2, x2], "mask": "<base64 PNG grayscale mask>"}
+Coordinates 0-1000. Mask grayscale PNG, white=keep, black=discard.
+If "${label}" is not found, return an empty object {}.
+Return ONLY the JSON, no other text.`;
 
-        if (seg.box_2d && seg.box_2d.length === 4) {
-          const [y1, x1, y2, x2] = seg.box_2d;
-          const bx = Math.round((x1 / 1000) * canvasW);
-          const by = Math.round((y1 / 1000) * canvasH);
-          const bw = Math.round(((x2 - x1) / 1000) * canvasW);
-          const bh = Math.round(((y2 - y1) / 1000) * canvasH);
+          const res = await fetchWithRetry(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [
+                { parts: [{ text: prompt }, { inlineData: { mimeType: "image/png", data: base64Image } }] },
+              ],
+              generationConfig: {
+                temperature: 0,
+                thinkingConfig: { thinkingBudget: 0 },
+                maxOutputTokens: 8192,
+                responseMimeType: "application/json",
+              },
+            }),
+          });
 
-          const resized = await sharp.default(maskData)
-            .resize(Math.max(1, bw), Math.max(1, bh), { fit: "fill" })
+          if (!res.ok) {
+            const errBody = await res.text();
+            console.warn(`[extractLayers] ${label} API error ${res.status}: ${errBody.slice(0, 200)}`);
+            return null;
+          }
+
+          const data = await res.json();
+          const textPart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
+          if (!textPart) {
+            console.warn(`[extractLayers] ${label}: no text response`);
+            return null;
+          }
+
+          const rawText = textPart.text.trim();
+          console.log(`[extractLayers] ${label}: raw length=${rawText.length}`);
+
+          const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+          if (!jsonMatch) {
+            console.warn(`[extractLayers] ${label}: no JSON. Got: ${rawText.slice(0, 100)}`);
+            return null;
+          }
+
+          const seg: SegmentationBox = JSON.parse(jsonMatch[0]);
+          if (!seg.mask) {
+            console.warn(`[extractLayers] ${label}: no mask in response`);
+            return null;
+          }
+
+          // Strip data URL prefix if present
+          let maskB64 = seg.mask;
+          if (maskB64.includes("base64,")) {
+            maskB64 = maskB64.split("base64,")[1];
+          }
+
+          const maskData = Buffer.from(maskB64, "base64");
+          let maskCanvas: Buffer;
+
+          if (seg.box_2d && seg.box_2d.length === 4) {
+            let [y1, x1, y2, x2] = seg.box_2d;
+            // Clamp coordinates to valid range
+            y1 = Math.max(0, Math.min(1000, y1));
+            x1 = Math.max(0, Math.min(1000, x1));
+            y2 = Math.max(0, Math.min(1000, y2));
+            x2 = Math.max(0, Math.min(1000, x2));
+            if (x2 <= x1 || y2 <= y1) {
+              // Invalid box, resize mask to full canvas
+              maskCanvas = await sharp.default(maskData)
+                .resize(canvasW, canvasH, { fit: "fill" })
+                .png()
+                .toBuffer();
+            } else {
+              const bx = Math.round((x1 / 1000) * canvasW);
+              const by = Math.round((y1 / 1000) * canvasH);
+              let bw = Math.round(((x2 - x1) / 1000) * canvasW);
+              let bh = Math.round(((y2 - y1) / 1000) * canvasH);
+              // Clamp within canvas
+              bw = Math.min(bw, canvasW - bx);
+              bh = Math.min(bh, canvasH - by);
+
+              const resized = await sharp.default(maskData)
+                .resize(Math.max(1, bw), Math.max(1, bh), { fit: "fill" })
+                .png()
+                .toBuffer();
+
+              maskCanvas = await sharp.default({
+                create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+              })
+                .composite([{ input: resized, left: bx, top: by }])
+                .png()
+                .toBuffer();
+            }
+          } else {
+            maskCanvas = await sharp.default(maskData)
+              .resize(canvasW, canvasH, { fit: "fill" })
+              .png()
+              .toBuffer();
+          }
+
+          const binaryMask = await sharp.default(maskCanvas)
+            .grayscale()
+            .threshold(128)
             .png()
             .toBuffer();
 
-          maskCanvas = await sharp.default({
-            create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
-          })
-            .composite([{ input: resized, left: bx, top: by }])
-            .png()
-            .toBuffer();
-        } else {
-          maskCanvas = await sharp.default(maskData)
-            .resize(canvasW, canvasH, { fit: "fill" })
-            .png()
-            .toBuffer();
+          return {
+            name: label,
+            type: type,
+            imageUrl: "",
+            maskUrl: `data:image/png;base64,${binaryMask.toString("base64")}`,
+          };
+        } catch (err) {
+          console.warn(`[extractLayers] ${label} failed:`, err instanceof Error ? err.message : err);
+          return null;
         }
-
-        // Binarize using sharp threshold (grayscale → binary at 128)
-        const binaryMask = await sharp.default(maskCanvas)
-          .grayscale()
-          .threshold(128)
-          .png()
-          .toBuffer();
-
-        return {
-          name: label.charAt(0) + label.slice(1).toLowerCase(),
-          type: label,
-          imageUrl: "",
-          maskUrl: `data:image/png;base64,${binaryMask.toString("base64")}`,
-        };
       })
     );
 
+    const components = results.filter((r): r is NonNullable<typeof r> => r !== null);
+    console.log(`[extractLayers] ${components.length}/${componentTypes.length} components extracted`);
     return { components };
   }
 
