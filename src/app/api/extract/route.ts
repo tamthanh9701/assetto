@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { Client } from "@upstash/qstash";
 
 export const maxDuration = 30;
 
@@ -18,16 +19,26 @@ export async function POST(req: Request) {
     if (!scene) return NextResponse.json({ error: "Scene not found" }, { status: 404 });
 
     const job = await prisma.job.create({
-      data: { sceneId, type: "extract", status: "pending", progress: 0, metadata: { imageUrl } },
+      data: {
+        userId: session.user.id,
+        sceneId,
+        type: "extract",
+        status: "pending",
+        progress: 0,
+        metadata: { imageUrl },
+      },
     });
 
-    // Fire worker asynchronously — no await, no blocking
-    const workerUrl = new URL("/api/extract/worker", process.env.NEXT_PUBLIC_APP_URL || req.url);
-    fetch(workerUrl.toString(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jobId: job.id }),
-    }).catch((e) => console.error("[extract] Failed to fire worker:", e));
+    // Publish to QStash — guaranteed delivery, auto-retry on failure
+    const q = new Client({ token: process.env.QSTASH_TOKEN || "" });
+    const workerUrl = `${process.env.NEXT_PUBLIC_APP_URL}/api/extract/worker`;
+
+    await q.publishJSON({
+      url: workerUrl,
+      body: { jobId: job.id },
+      // Retry up to 3 times with exponential backoff
+      retries: 3,
+    });
 
     return NextResponse.json({ jobId: job.id, status: "pending" }, { status: 202 });
   } catch (err) {

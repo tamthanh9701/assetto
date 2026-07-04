@@ -2,8 +2,107 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getProvider } from "@/lib/ai/registry";
 import { persistImage } from "@/lib/storage";
+import { verifySignature } from "@upstash/qstash/nextjs";
+import Replicate from "replicate";
 
 export const maxDuration = 300;
+
+const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN || "" });
+
+const MATTING_RETRIES = 2;
+
+async function matteImage(cropBuffer: Buffer, isBackground: boolean): Promise<{ buffer: Buffer; w: number; h: number }> {
+  if (isBackground) {
+    // Background: keep as-is
+    const sharp = await import("sharp");
+    const meta = await sharp.default(cropBuffer).metadata();
+    const w = meta.width || 0, h = meta.height || 0;
+    const buf = await sharp.default(cropBuffer, { raw: { width: w, height: h, channels: 4 } }).png().toBuffer();
+    return { buffer: buf, w, h };
+  }
+
+  const sharp = await import("sharp");
+  let meta = await sharp.default(cropBuffer).metadata();
+  let w = meta.width || 0, h = meta.height || 0;
+
+  // Try Replicate BiRefNet for matting
+  let matted: Buffer | null = null;
+  for (let attempt = 0; attempt <= MATTING_RETRIES; attempt++) {
+    try {
+      const inputBase64 = (await sharp.default(cropBuffer, { raw: { width: w, height: h, channels: 4 } }).png().toBuffer()).toString("base64");
+      const dataUrl = `data:image/png;base64,${inputBase64}`;
+
+      const output = await replicate.run(
+        "men1scus/birefnet:9aef7538a7e5e6318dd7cbbfb8cd18aa76d5258e6ef2c4117e3e9f40d45c9ea7",
+        { input: { image: dataUrl } }
+      );
+
+      if (output && typeof output === "string") {
+        const res = await fetch(output);
+        if (res.ok) {
+          matted = Buffer.from(await res.arrayBuffer());
+          break;
+        }
+      }
+    } catch (e) {
+      console.warn(`[matting] attempt ${attempt} failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+
+  if (matted) {
+    const resized = await sharp.default(matted)
+      .resize(w, h, { fit: "fill" })
+      .png()
+      .toBuffer();
+    return { buffer: resized, w, h };
+  }
+
+  // Fallback: chroma-key
+  console.warn("[matting] BiRefNet failed, fallback to chromaKey");
+  const keyed = Buffer.from((() => {
+    const pixels = new Uint8Array(cropBuffer);
+    const bpp = 4;
+    const stride = w * bpp;
+    const corners: Rgba[] = [
+      { r: pixels[0], g: pixels[1], b: pixels[2], a: pixels[3] },
+      { r: pixels[(w - 1) * bpp], g: pixels[(w - 1) * bpp + 1], b: pixels[(w - 1) * bpp + 2], a: pixels[(w - 1) * bpp + 3] },
+      { r: pixels[(h - 1) * stride], g: pixels[(h - 1) * stride + 1], b: pixels[(h - 1) * stride + 2], a: pixels[(h - 1) * stride + 3] },
+      { r: pixels[(h - 1) * stride + (w - 1) * bpp], g: pixels[(h - 1) * stride + (w - 1) * bpp + 1], b: pixels[(h - 1) * stride + (w - 1) * bpp + 2], a: pixels[(h - 1) * stride + (w - 1) * bpp + 3] },
+    ];
+    const bgColor: Rgba = {
+      r: Math.round(corners.reduce((s, c) => s + c.r, 0) / 4),
+      g: Math.round(corners.reduce((s, c) => s + c.g, 0) / 4),
+      b: Math.round(corners.reduce((s, c) => s + c.b, 0) / 4),
+      a: 255,
+    };
+    const visited = new Uint8Array(w * h);
+    const queue: number[] = [];
+    const idx = (x: number, y: number) => y * w + x;
+    for (let x = 0; x < w; x++) { queue.push(idx(x, 0), idx(x, h - 1)); }
+    for (let y = 0; y < h; y++) { queue.push(idx(0, y), idx(w - 1, y)); }
+    let qi = 0;
+    while (qi < queue.length) {
+      const i = queue[qi++];
+      if (visited[i]) continue;
+      visited[i] = 1;
+      const pi = i * bpp;
+      const px: Rgba = { r: pixels[pi], g: pixels[pi + 1], b: pixels[pi + 2], a: pixels[pi + 3] };
+      if (colorDist(px, bgColor) > 28) continue;
+      pixels[pi + 3] = 0;
+      const x = i % w;
+      const y = Math.floor(i / w);
+      if (x > 0) queue.push(i - 1);
+      if (x < w - 1) queue.push(i + 1);
+      if (y > 0) queue.push(i - w);
+      if (y < h - 1) queue.push(i + w);
+    }
+    return pixels;
+  })());
+
+  const buf = await sharp.default(keyed, { raw: { width: w, height: h, channels: 4 } }).trim().png().toBuffer();
+  const trimmed = await sharp.default(buf).metadata();
+  return { buffer: buf, w: trimmed.width || w, h: trimmed.height || h };
+}
 
 function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
@@ -13,43 +112,6 @@ interface Rgba { r: number; g: number; b: number; a: number }
 
 function colorDist(a: Rgba, b: Rgba): number {
   return Math.sqrt((a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2);
-}
-
-function chromaKey(raw: Buffer, w: number, h: number, tolerance: number): Buffer {
-  const pixels = new Uint8Array(raw);
-  const bpp = 4;
-  const stride = w * bpp;
-  const corners: Rgba[] = [
-    { r: pixels[0], g: pixels[1], b: pixels[2], a: pixels[3] },
-    { r: pixels[(w - 1) * bpp], g: pixels[(w - 1) * bpp + 1], b: pixels[(w - 1) * bpp + 2], a: pixels[(w - 1) * bpp + 3] },
-    { r: pixels[(h - 1) * stride], g: pixels[(h - 1) * stride + 1], b: pixels[(h - 1) * stride + 2], a: pixels[(h - 1) * stride + 3] },
-    { r: pixels[(h - 1) * stride + (w - 1) * bpp], g: pixels[(h - 1) * stride + (w - 1) * bpp + 1], b: pixels[(h - 1) * stride + (w - 1) * bpp + 2], a: pixels[(h - 1) * stride + (w - 1) * bpp + 3] },
-  ];
-  const bgColor: Rgba = { r: Math.round(corners.reduce((s, c) => s + c.r, 0) / 4), g: Math.round(corners.reduce((s, c) => s + c.g, 0) / 4), b: Math.round(corners.reduce((s, c) => s + c.b, 0) / 4), a: 255 };
-
-  const visited = new Uint8Array(w * h);
-  const queue: number[] = [];
-  const idx = (x: number, y: number) => y * w + x;
-  for (let x = 0; x < w; x++) { queue.push(idx(x, 0), idx(x, h - 1)); }
-  for (let y = 0; y < h; y++) { queue.push(idx(0, y), idx(w - 1, y)); }
-
-  let qi = 0;
-  while (qi < queue.length) {
-    const i = queue[qi++];
-    if (visited[i]) continue;
-    visited[i] = 1;
-    const pi = i * bpp;
-    const px: Rgba = { r: pixels[pi], g: pixels[pi + 1], b: pixels[pi + 2], a: pixels[pi + 3] };
-    if (colorDist(px, bgColor) > tolerance) continue;
-    pixels[pi + 3] = 0;
-    const x = i % w;
-    const y = Math.floor(i / w);
-    if (x > 0) queue.push(i - 1);
-    if (x < w - 1) queue.push(i + 1);
-    if (y > 0) queue.push(i - w);
-    if (y < h - 1) queue.push(i + w);
-  }
-  return Buffer.from(pixels);
 }
 
 function morphologyOpen(src: Uint8Array, w: number, h: number, ksize: number): Uint8Array {
@@ -262,6 +324,16 @@ async function getOrCreateGroup(sceneId: string, type: string, order: number) {
 }
 
 export async function POST(req: Request) {
+  // Verify: QStash signature OR x-worker-secret header
+  const authHeader = req.headers.get("x-worker-secret") || req.headers.get("authorization") || "";
+  const qstashSig = req.headers.get("upstash-signature") || "";
+  const isQStash = qstashSig.length > 0;
+  const isDirect = authHeader === process.env.WORKER_SECRET;
+
+  if (!isQStash && !isDirect) {
+    console.warn("[worker] unauthorized access attempt");
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
   let jobId: string | null = null;
   try {
     const body = await req.json();
@@ -325,11 +397,8 @@ export async function POST(req: Request) {
           const ch = clamp(Math.round(((seg.box2d[2] - seg.box2d[0]) / 1000) * H), 1, H - top);
 
           let cropBuffer = await sharp.default(imgBuffer).extract({ left, top, width: cw, height: ch }).ensureAlpha().raw().toBuffer();
-          cropBuffer = Buffer.from(chromaKey(cropBuffer, cw, ch, 28));
-          const cleanPng = await sharp.default(cropBuffer, { raw: { width: cw, height: ch, channels: 4 } }).trim().png().toBuffer();
-          const trimMeta = await sharp.default(cleanPng).metadata();
-          const tw = trimMeta.width || cw;
-          const th = trimMeta.height || ch;
+          const { buffer: mattedBuffer, w: tw, h: th } = await matteImage(cropBuffer, type === "BACKGROUND");
+          const cleanPng = mattedBuffer;
 
           const group = await getOrCreateGroup(sceneId, type, batchStart + batch.indexOf(seg));
           const assets: any[] = [];
@@ -406,10 +475,46 @@ export async function POST(req: Request) {
       });
     }
 
-    await prisma.job.update({
-      where: { id: jobId },
-      data: { status: "completed", progress: 100 },
+    // Create ZIP of all scene assets
+    const sceneAssets = await prisma.asset.findMany({
+      where: { sceneId },
+      select: { name: true, pngUrl: true, subType: true },
     });
+
+    if (sceneAssets.length > 0) {
+      const JSZip = (await import("jszip")).default;
+      const zip = new JSZip();
+
+      for (const asset of sceneAssets) {
+        if (!asset.pngUrl) continue;
+        try {
+          const res = await fetch(asset.pngUrl);
+          if (!res.ok) continue;
+          const buf = await res.arrayBuffer();
+          const folder = asset.subType || "main";
+          zip.file(`${folder}/${asset.name}.png`, buf);
+        } catch {
+          console.warn(`[worker] failed to add ${asset.name} to ZIP`);
+        }
+      }
+
+      const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
+      const { put } = await import("@vercel/blob");
+      const zipResult = await put(`zip_${sceneId.slice(0, 6)}_${Date.now()}.zip`, zipBuffer, {
+        access: "public",
+        addRandomSuffix: true,
+      });
+
+      await prisma.job.update({
+        where: { id: jobId },
+        data: { status: "completed", progress: 100, resultZipUrl: zipResult.url },
+      });
+    } else {
+      await prisma.job.update({
+        where: { id: jobId },
+        data: { status: "completed", progress: 100 },
+      });
+    }
 
     console.log(`[worker] ${results.length} components extracted for job ${jobId}`);
     return NextResponse.json({ components: results.length });

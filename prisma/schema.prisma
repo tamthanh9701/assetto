@@ -141,6 +141,7 @@ model Asset {
 
 model Job {
   id            String   @id @default(cuid())
+  userId        String?
   sceneId       String?
   type          String   @default("extract")
   status        String   @default("pending")
