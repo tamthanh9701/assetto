@@ -114,12 +114,11 @@ async function matteImage(cropBuffer: Buffer, isBackground: boolean): Promise<{ 
 
 const SAM_RETRIES = 1;
 
-async function splitWithSAM(cleanPng: Buffer, w: number, h: number): Promise<{ iconMask: Uint8Array; frameMask: Uint8Array; samUsed: boolean }> {
+async function splitWithSAM(cleanPng: Buffer, w: number, h: number, isRound: boolean): Promise<{ iconMask: Uint8Array; frameMask: Uint8Array; samUsed: boolean }> {
   const sharp = await import("sharp");
   const rawPixels = await sharp.default(cleanPng).ensureAlpha().raw().toBuffer();
   const bpp = 4;
 
-  // Default: icon mask from SAM; fallback: splitLocal
   let iconMask: Uint8Array | null = null;
 
   for (let attempt = 0; attempt <= SAM_RETRIES; attempt++) {
@@ -127,20 +126,32 @@ async function splitWithSAM(cleanPng: Buffer, w: number, h: number): Promise<{ i
       const inputBase64 = (await sharp.default(cleanPng).png().toBuffer()).toString("base64");
       const dataUrl = `data:image/png;base64,${inputBase64}`;
 
-      // Point prompt at center of crop
-      const cx = Math.round((50 / 100) * 1000); // normalized 0-1000
-      const cy = Math.round((50 / 100) * 1000);
-      const points = [[cx, cy, 1]]; // [x, y, label=1 (foreground)]
+      // Point prompt at center of crop — pixel coords
+      const cx = Math.round(w / 2);
+      const cy = Math.round(h / 2);
 
+      // meta/sam-2 expects: image, point_coords string "[[x1,y1],[x2,y2]]", point_labels string "1,1"
       const output = await replicate.run(
-        "sczhou/sam-2:0ebdd59f4ef3c7b3e0cf95f66c2bfa6ffd6cae4b15b5c8f1a8f4e7e4e4e4e4e4",
-        { input: { image: dataUrl, point_coords: JSON.stringify(points), point_labels: "1" } }
+        "meta/sam-2",
+        {
+          input: {
+            image: dataUrl,
+            point_coords: JSON.stringify([[cx, cy]]),
+            point_labels: "1",
+          },
+        }
       );
 
       let maskUrl: string | null = null;
       if (typeof output === "string") maskUrl = output;
       else if (Array.isArray(output)) maskUrl = typeof output[0] === "string" ? output[0] : null;
       else if (output && typeof (output as any).url === "function") maskUrl = (output as any).url();
+
+      // SAM-2 returns image with mask, not just mask — need to also handle output from https://replicate.com/meta/sam-2
+      // It may return { mask: "url", combined: "url" } or just mask url string.
+      if (output && typeof output === "object" && !Array.isArray(output)) {
+        maskUrl = (output as any).mask || (output as any).combined || null;
+      }
 
       if (maskUrl) {
         const res = await fetch(maskUrl);
@@ -157,7 +168,6 @@ async function splitWithSAM(cleanPng: Buffer, w: number, h: number): Promise<{ i
   }
 
   if (iconMask) {
-    // Threshold SAM output
     for (let i = 0; i < w * h; i++) iconMask[i] = iconMask[i] > 128 ? 255 : 0;
 
     const frameMask = new Uint8Array(w * h);
@@ -168,9 +178,9 @@ async function splitWithSAM(cleanPng: Buffer, w: number, h: number): Promise<{ i
     return { iconMask, frameMask, samUsed: true };
   }
 
-  // Fallback: splitLocal
+  // Fallback: splitLocal with real isRound
   console.warn("[sam] SAM failed, fallback to splitLocal");
-  const fallback = splitLocal(rawPixels, w, h, true);
+  const fallback = splitLocal(rawPixels, w, h, isRound);
   return { iconMask: fallback.iconMask, frameMask: fallback.frameMask, samUsed: false };
 }
 
@@ -489,7 +499,7 @@ export async function POST(req: Request) {
 
           if (shouldSplit) {
             const rawPixels = await sharp.default(cleanPng).ensureAlpha().raw().toBuffer();
-            const { iconMask, frameMask, samUsed } = await splitWithSAM(cleanPng, tw, th);
+            const { iconMask, frameMask, samUsed } = await splitWithSAM(cleanPng, tw, th, isRound);
             if (samUsed) samCount++;
             const bpp = 4;
 
@@ -515,19 +525,12 @@ export async function POST(req: Request) {
                 else framePixels[(y * tw + x) * bpp + 3] = 0;
               }
             }
-            const frameBuffer = await sharp.default(framePixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
 
             const iconT = ((tw * th - iconOpaque) / (tw * th) * 100).toFixed(1);
             const frameT = ((tw * th - frameOpaque) / (tw * th) * 100).toFixed(1);
             console.log(`[worker] ${label} core=${iconT}% frame=${frameT}% full=${fullPct}% split=${samUsed ? "SAM" : "local"}`);
 
-            const iconUrl = await persistImage(`data:image/png;base64,${iconBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
-            const frameUrl = await persistImage(`data:image/png;base64,${frameBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
-            const iconAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_core`, type: group.type as any, subType: "core", pngUrl: iconUrl, transparent: true, componentGroupId: group.id, sceneId } });
-            const frameAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_frame`, type: group.type as any, subType: "frame", pngUrl: frameUrl, transparent: true, componentGroupId: group.id, sceneId } });
-            assets.push(iconAsset, frameAsset);
-
-            // Plus badge detection
+            // Plus badge detection — scan top-right quadrant for red pixels
             const qw = Math.round(tw * 0.35);
             const qh = Math.round(th * 0.35);
             let hasRed = false;
@@ -538,17 +541,21 @@ export async function POST(req: Request) {
               }
               if (hasRed) break;
             }
+
             if (hasRed) {
               const plusPixels = new Uint8Array(rawPixels);
-              for (let y = 0; y < qh && y < th; y++) {
-                for (let x = tw - qw; x < tw; x++) {
+              for (let y = 0; y < th; y++) {
+                for (let x = 0; x < tw; x++) {
                   const i = y * tw + x;
                   const pi = i * bpp;
-                  if (rawPixels[pi + 3] > 128 && rawPixels[pi] > 180 && rawPixels[pi + 1] < 100 && rawPixels[pi + 2] < 100) {
-                    plusPixels[pi + 3] = 0;
+                  const isRed = (x >= tw - qw && y < qh && rawPixels[pi + 3] > 128 && rawPixels[pi] > 180 && rawPixels[pi + 1] < 100 && rawPixels[pi + 2] < 100);
+                  if (isRed) {
+                    // Keep red pixels visible in plus image
+                    // Do nothing — keep alpha
                     // Also punch from frame
                     framePixels[pi + 3] = 0;
                   } else {
+                    // Everything else transparent in plus image
                     plusPixels[pi + 3] = 0;
                   }
                 }
@@ -565,7 +572,17 @@ export async function POST(req: Request) {
                 where: { sceneId, name: `${label}_${sceneId.slice(0, 6)}_frame` },
                 data: { pngUrl: fixedFrameUrl },
               });
+            } else {
+              // No plus badge — save frame as-is
+              const frameBuffer = await sharp.default(framePixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
+              const frameUrl = await persistImage(`data:image/png;base64,${frameBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
+              const frameAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_frame`, type: group.type as any, subType: "frame", pngUrl: frameUrl, transparent: true, componentGroupId: group.id, sceneId } });
+              assets.push(frameAsset);
             }
+
+            const iconUrl = await persistImage(`data:image/png;base64,${iconBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
+            const iconAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_core`, type: group.type as any, subType: "core", pngUrl: iconUrl, transparent: true, componentGroupId: group.id, sceneId } });
+            assets.push(iconAsset);
           }
 
           const mainPngUrl = await persistImage(`data:image/png;base64,${cleanPng.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}`);
