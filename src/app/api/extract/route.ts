@@ -53,65 +53,190 @@ function chromaKey(raw: Buffer, w: number, h: number, tolerance: number): Buffer
   return Buffer.from(pixels);
 }
 
-async function segmentIconMask(cleanPng: Buffer, w: number, h: number): Promise<Buffer | null> {
-  try {
-    const sharp = await import("sharp");
-    const base64 = cleanPng.toString("base64");
-    const apiKey = process.env.GEMINI_API_KEY || "";
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [
-          { text: "Return a segmentation mask (base64 PNG) covering ONLY the central icon symbol, EXCLUDING the round gold frame/border and background. JSON: {\"mask\":\"<base64 PNG>\", \"box_2d\":[y1,x1,y2,x2]}. Coordinates 0-1000. Return ONLY the JSON." },
-          { inlineData: { mimeType: "image/png", data: base64 } },
-        ]}],
-        generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: "application/json" },
-      }),
-    });
-
-    if (!res.ok) return null;
-    const data = await res.json();
-    const textPart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
-    if (!textPart) return null;
-
-    const objMatch = textPart.text.trim().match(/\{[\s\S]*\}/);
-    if (!objMatch) return null;
-    const result = JSON.parse(objMatch[0]);
-    if (!result.mask) return null;
-
-    let maskB64 = result.mask;
-    if (maskB64.includes("base64,")) maskB64 = maskB64.split("base64,")[1];
-
-    const maskBuffer = Buffer.from(maskB64, "base64");
-    const resized = await sharp.default(maskBuffer)
-      .resize(w, h, { fit: "fill" })
-      .grayscale()
-      .threshold(128)
-      .raw()
-      .toBuffer();
-
-    return Buffer.from(resized);
-  } catch {
-    return null;
-  }
+function morphologyOpen(src: Uint8Array, w: number, h: number, ksize: number): Uint8Array {
+  const er = erode(src, w, h, ksize);
+  return dilate(er, w, h, ksize);
 }
 
-async function radialMask(w: number, h: number): Promise<Buffer> {
-  const cx = w / 2;
-  const cy = h / 2;
-  const R = Math.min(w, h) / 2;
-  const innerR = 0.58 * R;
-  const mask = new Uint8Array(w * h);
+function morphologyClose(src: Uint8Array, w: number, h: number, ksize: number): Uint8Array {
+  const di = dilate(src, w, h, ksize);
+  return erode(di, w, h, ksize);
+}
+
+function dilate(src: Uint8Array, w: number, h: number, ksize: number): Uint8Array {
+  const dst = new Uint8Array(w * h);
+  const half = Math.floor(ksize / 2);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const dx = x - cx, dy = y - cy;
-      if (Math.sqrt(dx * dx + dy * dy) < innerR) mask[y * w + x] = 255;
+      let max = 0;
+      for (let ky = -half; ky <= half; ky++) {
+        for (let kx = -half; kx <= half; kx++) {
+          const px = x + kx, py = y + ky;
+          if (px >= 0 && px < w && py >= 0 && py < h) {
+            if (src[py * w + px] > max) max = src[py * w + px];
+          }
+        }
+      }
+      dst[y * w + x] = max;
     }
   }
-  return Buffer.from(mask);
+  return dst;
+}
+
+function erode(src: Uint8Array, w: number, h: number, ksize: number): Uint8Array {
+  const dst = new Uint8Array(w * h);
+  const half = Math.floor(ksize / 2);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let min = 255;
+      for (let ky = -half; ky <= half; ky++) {
+        for (let kx = -half; kx <= half; kx++) {
+          const px = x + kx, py = y + ky;
+          if (px >= 0 && px < w && py >= 0 && py < h) {
+            if (src[py * w + px] < min) min = src[py * w + px];
+          }
+        }
+      }
+      dst[y * w + x] = min;
+    }
+  }
+  return dst;
+}
+
+function connectedComponents(src: Uint8Array, w: number, h: number, threshold: number): Int32Array {
+  const labels = new Int32Array(w * h);
+  for (let i = 0; i < w * h; i++) labels[i] = src[i] >= threshold ? -2 : -1;
+
+  let nextLabel = 0;
+  const stack: number[] = [];
+
+  for (let i = 0; i < w * h; i++) {
+    if (labels[i] !== -2) continue;
+    labels[i] = nextLabel;
+    stack.push(i);
+    while (stack.length) {
+      const ci = stack.pop()!;
+      const x = ci % w, y = Math.floor(ci / w);
+      for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+        const ni = ny * w + nx;
+        if (labels[ni] === -2) {
+          labels[ni] = nextLabel;
+          stack.push(ni);
+        }
+      }
+    }
+    nextLabel++;
+  }
+
+  return labels;
+}
+
+// Local image processing to split icon from ring frame (NO Gemini call)
+function splitLocal(rawPng: Buffer, w: number, h: number):
+  { iconMask: Uint8Array; frameMask: Uint8Array } {
+  const src = new Uint8Array(rawPng);
+  const bpp = 4;
+  const opaque = new Uint8Array(w * h);
+  const rArr = new Uint8Array(w * h);
+  const gArr = new Uint8Array(w * h);
+  const bArr = new Uint8Array(w * h);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const pi = (y * w + x) * bpp;
+      const a = src[pi + 3];
+      opaque[y * w + x] = a > 100 ? 255 : 0;
+      rArr[y * w + x] = src[pi];
+      gArr[y * w + x] = src[pi + 1];
+      bArr[y * w + x] = src[pi + 2];
+    }
+  }
+
+  const cx = w / 2;
+  const cy = h / 2;
+  const Rmax = Math.min(w, h) / 2;
+  const dist = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      dist[y * w + x] = Math.sqrt((x - cx) ** 2 + (y - cy) ** 2);
+    }
+  }
+
+  // Estimate ring color: median RGB of opaque pixels within 0.80-0.99*Rmax
+  const ringSamples: Rgba[] = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const d = dist[i];
+      if (opaque[i] > 0 && d >= 0.80 * Rmax && d <= 0.99 * Rmax) {
+        ringSamples.push({ r: rArr[i], g: gArr[i], b: bArr[i], a: 255 });
+      }
+    }
+  }
+  // Median (approximate: sort and pick middle)
+  let ringColor: Rgba = { r: 200, g: 180, b: 100, a: 255 };
+  if (ringSamples.length > 0) {
+    ringSamples.sort((a, b) => a.r - b.r);
+    const mid = Math.floor(ringSamples.length / 2);
+    const ms = ringSamples[mid];
+    // Average closest 20% around median for stability
+    const windowStart = Math.max(0, mid - Math.floor(ringSamples.length * 0.1));
+    const windowEnd = Math.min(ringSamples.length, mid + Math.floor(ringSamples.length * 0.1));
+    const window = ringSamples.slice(windowStart, windowEnd);
+    ringColor = {
+      r: Math.round(window.reduce((s, c) => s + c.r, 0) / window.length),
+      g: Math.round(window.reduce((s, c) => s + c.g, 0) / window.length),
+      b: Math.round(window.reduce((s, c) => s + c.b, 0) / window.length),
+      a: 255,
+    };
+  }
+
+  // is_ring = opaque & R>0.60*Rmax & colorDist(rgb, ringColor) < 75
+  const isRing = new Uint8Array(w * h);
+  const iconCandidate = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    if (opaque[i] > 0 && dist[i] > 0.60 * Rmax) {
+      const d = colorDist({ r: rArr[i], g: gArr[i], b: bArr[i], a: 255 }, ringColor);
+      isRing[i] = d < 75 ? 255 : 0;
+      iconCandidate[i] = d < 75 ? 0 : 255;
+    } else if (opaque[i] > 0) {
+      iconCandidate[i] = 255;
+    }
+  }
+
+  // Morphological OPEN(3) to remove noise
+  const opened = morphologyOpen(iconCandidate, w, h, 3);
+
+  // Connected components → find component containing center
+  const labels = connectedComponents(opened, w, h, 128);
+  const cxInt = Math.round(cx);
+  const cyInt = Math.round(cy);
+  const centerLabel = labels[cyInt * w + cxInt];
+
+  // Keep only center component
+  const centerMask = new Uint8Array(w * h);
+  if (centerLabel >= 0) {
+    for (let i = 0; i < w * h; i++) {
+      centerMask[i] = (labels[i] === centerLabel) ? 255 : 0;
+    }
+  } else {
+    // Fallback: just take opened (morphology only)
+    for (let i = 0; i < w * h; i++) centerMask[i] = opened[i];
+  }
+
+  // CLOSE(7)+dilate(3) to fill holes
+  const closed = morphologyClose(centerMask, w, h, 7);
+  const iconMask = dilate(closed, w, h, 3);
+
+  // Frame: keep ring pixels (NOT icon), but keep opacity from original
+  const frameMask = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    frameMask[i] = (opaque[i] > 0 && iconMask[i] === 0) ? 255 : 0;
+  }
+
+  return { iconMask, frameMask };
 }
 
 export async function POST(req: Request) {
@@ -147,7 +272,15 @@ export async function POST(req: Request) {
         batch.map(async (seg) => {
           const label = seg.name;
           const type = seg.type;
-          const isIconButton = type.startsWith("ICON") || type.startsWith("BUTTON") || type.startsWith("BADGE");
+          const isIcon = (type.startsWith("ICON") || type.startsWith("BUTTON") || type.startsWith("BADGE"));
+          const isRound = isIcon && (() => {
+            if (!seg.box2d) return false;
+            const [_y1, _x1, _y2, _x2] = seg.box2d;
+            const bw = (_x2 - _x1), bh = (_y2 - _y1);
+            if (bw <= 0 || bh <= 0) return false;
+            const r = bw / bh;
+            return r >= 0.85 && r <= 1.18;
+          })();
 
           if (!seg.box2d) {
             const pngUrl = await persistImage(imageUrl, `comp_${sceneId.slice(0, 6)}_${label}`);
@@ -172,59 +305,46 @@ export async function POST(req: Request) {
           const group = await getOrCreateGroup(sceneId, type, batchStart + batch.indexOf(seg));
           const assets: any[] = [];
 
-          if (isIconButton) {
-            // Per-pixel mask via Gemini segmentation
-            const mask = await segmentIconMask(cleanPng, tw, th);
-            const isAI = mask !== null;
-            const alphaMask = mask || (await radialMask(tw, th));
-
-            if (!isAI) console.warn(`[extract] ${label}: mask from AI failed, fallback to radial`);
-
-            // Core: apply mask as alpha
+          if (isRound) {
+            // Fully local processing: NO Gemini call
             const rawPixels = await sharp.default(cleanPng).ensureAlpha().raw().toBuffer();
-            const pixels = new Uint8Array(rawPixels);
+            const { iconMask, frameMask } = splitLocal(rawPixels, tw, th);
             const bpp = 4;
-            let coreTransparent = 0;
-            let coreTotal = 0;
+
+            // Icon: apply iconMask as alpha
+            const iconPixels = new Uint8Array(rawPixels);
+            let iconTransparentPct = 0;
             for (let y = 0; y < th; y++) {
               for (let x = 0; x < tw; x++) {
                 const pi = (y * tw + x) * bpp;
-                const mi = y * tw + x;
-                if (alphaMask[mi] < 128) {
-                  pixels[pi + 3] = 0;
-                  coreTransparent++;
-                }
-                coreTotal++;
+                if (iconMask[y * tw + x] < 128) iconPixels[pi + 3] = 0;
+                else iconTransparentPct++;
               }
             }
-            const coreBuffer = await sharp.default(pixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
-            const coreUrl = await persistImage(`data:image/png;base64,${coreBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
+            const iconBuffer = await sharp.default(iconPixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
 
-            // Frame: punch out mask pixels
+            // Frame: apply frameMask as alpha
             const framePixels = new Uint8Array(rawPixels);
-            let frameTransparent = 0;
-            let frameTotal = 0;
+            let frameTransparentPct = 0;
             for (let y = 0; y < th; y++) {
               for (let x = 0; x < tw; x++) {
                 const pi = (y * tw + x) * bpp;
-                const mi = y * tw + x;
-                if (alphaMask[mi] >= 128) {
-                  framePixels[pi + 3] = 0;
-                  frameTransparent++;
-                }
-                frameTotal++;
+                if (frameMask[y * tw + x] < 128) framePixels[pi + 3] = 0;
+                else frameTransparentPct++;
               }
             }
             const frameBuffer = await sharp.default(framePixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
+
+            const iconTransPct = (100 - iconTransparentPct / (tw * th) * 100).toFixed(1);
+            const frameTransPct = (100 - frameTransparentPct / (tw * th) * 100).toFixed(1);
+            console.log(`[extract] ${label}: icon_transparent=${iconTransPct}% frame_transparent=${frameTransPct}% (local)`);
+
+            const iconUrl = await persistImage(`data:image/png;base64,${iconBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
             const frameUrl = await persistImage(`data:image/png;base64,${frameBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
 
-            const corePct = ((coreTransparent / coreTotal) * 100).toFixed(1);
-            const framePct = ((frameTransparent / frameTotal) * 100).toFixed(1);
-            console.log(`[extract] ${label}: core_transparent=${corePct}% frame_transparent=${framePct}% method=${isAI ? "AI" : "radial"}`);
-
-            const coreAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_core`, type: group.type as any, subType: "core", pngUrl: coreUrl, transparent: true, componentGroupId: group.id, sceneId } });
+            const iconAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_core`, type: group.type as any, subType: "core", pngUrl: iconUrl, transparent: true, componentGroupId: group.id, sceneId } });
             const frameAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_frame`, type: group.type as any, subType: "frame", pngUrl: frameUrl, transparent: true, componentGroupId: group.id, sceneId } });
-            assets.push(coreAsset, frameAsset);
+            assets.push(iconAsset, frameAsset);
           }
 
           const mainPngUrl = await persistImage(`data:image/png;base64,${cleanPng.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}`);
