@@ -134,8 +134,9 @@ function connectedComponents(src: Uint8Array, w: number, h: number, threshold: n
 }
 
 // Local image processing to split icon from ring frame (NO Gemini call)
-function splitLocal(rawPng: Buffer, w: number, h: number):
-  { iconMask: Uint8Array; frameMask: Uint8Array } {
+// Returns iconMask, frameMask, plusBadgeUrl (if detected)
+function splitLocal(rawPng: Buffer, w: number, h: number, isRound: boolean):
+  { iconMask: Uint8Array; frameMask: Uint8Array; plusBadgeMask: Uint8Array | null } {
   const src = new Uint8Array(rawPng);
   const bpp = 4;
   const opaque = new Uint8Array(w * h);
@@ -154,6 +155,36 @@ function splitLocal(rawPng: Buffer, w: number, h: number):
     }
   }
 
+  // Detect plus badge: red pixels in top-right quadrant → set alpha=0 there, return mask
+  const qw = Math.round(w * 0.35);
+  const qh = Math.round(h * 0.35);
+  let plusBadgeMask: Uint8Array | null = null;
+  let hasRed = false;
+  for (let y = 0; y < qh && y < h; y++) {
+    for (let x = w - qw; x < w; x++) {
+      const pi = (y * w + x) * bpp;
+      if (src[pi + 3] > 128 && src[pi] > 180 && src[pi + 1] < 100 && src[pi + 2] < 100) {
+        hasRed = true; break;
+      }
+    }
+    if (hasRed) break;
+  }
+  if (hasRed) {
+    plusBadgeMask = new Uint8Array(w * h);
+    // Set alpha=0 for badge area in source copy
+    for (let y = 0; y < qh && y < h; y++) {
+      for (let x = w - qw; x < w; x++) {
+        const i = y * w + x;
+        const pi = i * bpp;
+        if (src[pi + 3] > 128 && src[pi] > 180 && src[pi + 1] < 100 && src[pi + 2] < 100) {
+          plusBadgeMask[i] = 255;
+          // Remove from opaque to avoid affecting icon/frame
+          opaque[i] = 0;
+        }
+      }
+    }
+  }
+
   const cx = w / 2;
   const cy = h / 2;
   const Rmax = Math.min(w, h) / 2;
@@ -164,27 +195,38 @@ function splitLocal(rawPng: Buffer, w: number, h: number):
     }
   }
 
-  // Estimate ring color: median RGB of opaque pixels within 0.80-0.99*Rmax
+  // For non-round icons, use ellipse: scale x-distance by aspect ratio
+  const aspect = w / h;
+  const invAspect = h / w;
+  const distEllipse = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dx = (x - cx) * (isRound ? 1 : invAspect);
+      const dy = (y - cy) * (isRound ? 1 : aspect);
+      distEllipse[y * w + x] = Math.sqrt(dx * dx + dy * dy);
+    }
+  }
+  const useDist = isRound ? dist : distEllipse;
+  const Rused = isRound ? Rmax : (Math.min(w, h) / 2) * Math.max(aspect, invAspect);
+
+  // Estimate ring color: median RGB of opaque pixels within 0.80-0.99*Rused
   const ringSamples: Rgba[] = [];
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
-      const d = dist[i];
-      if (opaque[i] > 0 && d >= 0.80 * Rmax && d <= 0.99 * Rmax) {
+      const d = useDist[i];
+      if (opaque[i] > 0 && d >= 0.80 * Rused && d <= 0.99 * Rused) {
         ringSamples.push({ r: rArr[i], g: gArr[i], b: bArr[i], a: 255 });
       }
     }
   }
-  // Median (approximate: sort and pick middle)
   let ringColor: Rgba = { r: 200, g: 180, b: 100, a: 255 };
   if (ringSamples.length > 0) {
     ringSamples.sort((a, b) => a.r - b.r);
     const mid = Math.floor(ringSamples.length / 2);
-    const ms = ringSamples[mid];
-    // Average closest 20% around median for stability
-    const windowStart = Math.max(0, mid - Math.floor(ringSamples.length * 0.1));
-    const windowEnd = Math.min(ringSamples.length, mid + Math.floor(ringSamples.length * 0.1));
-    const window = ringSamples.slice(windowStart, windowEnd);
+    const midV = Math.max(0, mid - Math.floor(ringSamples.length * 0.1));
+    const midVV = Math.min(ringSamples.length, mid + Math.floor(ringSamples.length * 0.1));
+    const window = ringSamples.slice(midV, midVV);
     ringColor = {
       r: Math.round(window.reduce((s, c) => s + c.r, 0) / window.length),
       g: Math.round(window.reduce((s, c) => s + c.g, 0) / window.length),
@@ -193,11 +235,12 @@ function splitLocal(rawPng: Buffer, w: number, h: number):
     };
   }
 
-  // is_ring = opaque & R>0.60*Rmax & colorDist(rgb, ringColor) < 75
+  // is_ring: use 0.55*Rused for non-round (more aggressive)
+  const ringThreshold = isRound ? 0.60 : 0.55;
   const isRing = new Uint8Array(w * h);
   const iconCandidate = new Uint8Array(w * h);
   for (let i = 0; i < w * h; i++) {
-    if (opaque[i] > 0 && dist[i] > 0.60 * Rmax) {
+    if (opaque[i] > 0 && useDist[i] > ringThreshold * Rused) {
       const d = colorDist({ r: rArr[i], g: gArr[i], b: bArr[i], a: 255 }, ringColor);
       isRing[i] = d < 75 ? 255 : 0;
       iconCandidate[i] = d < 75 ? 0 : 255;
@@ -206,7 +249,7 @@ function splitLocal(rawPng: Buffer, w: number, h: number):
     }
   }
 
-  // Morphological OPEN(3) to remove noise
+  // Morphological OPEN(3)
   const opened = morphologyOpen(iconCandidate, w, h, 3);
 
   // Connected components → find component containing center
@@ -215,28 +258,25 @@ function splitLocal(rawPng: Buffer, w: number, h: number):
   const cyInt = Math.round(cy);
   const centerLabel = labels[cyInt * w + cxInt];
 
-  // Keep only center component
   const centerMask = new Uint8Array(w * h);
   if (centerLabel >= 0) {
     for (let i = 0; i < w * h; i++) {
       centerMask[i] = (labels[i] === centerLabel) ? 255 : 0;
     }
   } else {
-    // Fallback: just take opened (morphology only)
     for (let i = 0; i < w * h; i++) centerMask[i] = opened[i];
   }
 
-  // CLOSE(7)+dilate(3) to fill holes
   const closed = morphologyClose(centerMask, w, h, 7);
   const iconMask = dilate(closed, w, h, 3);
 
-  // Frame: keep ring pixels (NOT icon), but keep opacity from original
+  // Frame: keep opaque pixels NOT in iconMask (and not in badge)
   const frameMask = new Uint8Array(w * h);
   for (let i = 0; i < w * h; i++) {
     frameMask[i] = (opaque[i] > 0 && iconMask[i] === 0) ? 255 : 0;
   }
 
-  return { iconMask, frameMask };
+  return { iconMask, frameMask, plusBadgeMask };
 }
 
 export async function POST(req: Request) {
@@ -281,8 +321,10 @@ export async function POST(req: Request) {
             const r = bw / bh;
             return r >= 0.85 && r <= 1.18;
           })();
+          const shouldSplit = isIcon && seg.box2d !== undefined;
 
           if (!seg.box2d) {
+            console.warn(`[extract] ${label}: no box2d, skipping split`);
             const pngUrl = await persistImage(imageUrl, `comp_${sceneId.slice(0, 6)}_${label}`);
             const group = await getOrCreateGroup(sceneId, type, 0);
             const mainAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}`, type: group.type as any, pngUrl, transparent: true, componentGroupId: group.id, sceneId } });
@@ -305,39 +347,48 @@ export async function POST(req: Request) {
           const group = await getOrCreateGroup(sceneId, type, batchStart + batch.indexOf(seg));
           const assets: any[] = [];
 
-          if (isRound) {
+          if (shouldSplit) {
             // Fully local processing: NO Gemini call
             const rawPixels = await sharp.default(cleanPng).ensureAlpha().raw().toBuffer();
-            const { iconMask, frameMask } = splitLocal(rawPixels, tw, th);
+            const { iconMask, frameMask, plusBadgeMask } = splitLocal(rawPixels, tw, th, isRound);
             const bpp = 4;
+
+            // Full transparency for verification
+            let fullOpaque = 0;
+            for (let i = 0; i < tw * th; i++) {
+              if (rawPixels[i * bpp + 3] > 100) fullOpaque++;
+            }
+            const fullPct = ((tw * th - fullOpaque) / (tw * th) * 100).toFixed(1);
 
             // Icon: apply iconMask as alpha
             const iconPixels = new Uint8Array(rawPixels);
-            let iconTransparentPct = 0;
+            let iconOpaque = 0;
             for (let y = 0; y < th; y++) {
               for (let x = 0; x < tw; x++) {
                 const pi = (y * tw + x) * bpp;
                 if (iconMask[y * tw + x] < 128) iconPixels[pi + 3] = 0;
-                else iconTransparentPct++;
+                else iconOpaque++;
               }
             }
             const iconBuffer = await sharp.default(iconPixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
 
             // Frame: apply frameMask as alpha
             const framePixels = new Uint8Array(rawPixels);
-            let frameTransparentPct = 0;
+            let frameOpaque = 0;
             for (let y = 0; y < th; y++) {
               for (let x = 0; x < tw; x++) {
                 const pi = (y * tw + x) * bpp;
                 if (frameMask[y * tw + x] < 128) framePixels[pi + 3] = 0;
-                else frameTransparentPct++;
+                else frameOpaque++;
               }
             }
             const frameBuffer = await sharp.default(framePixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
 
-            const iconTransPct = (100 - iconTransparentPct / (tw * th) * 100).toFixed(1);
-            const frameTransPct = (100 - frameTransparentPct / (tw * th) * 100).toFixed(1);
-            console.log(`[extract] ${label}: icon_transparent=${iconTransPct}% frame_transparent=${frameTransPct}% (local)`);
+            const iconT = ((tw * th - iconOpaque) / (tw * th) * 100).toFixed(1);
+            const frameT = ((tw * th - frameOpaque) / (tw * th) * 100).toFixed(1);
+            console.log(`[verify] ${label} core=${iconT}% frame=${frameT}% full=${fullPct}% method=${isRound ? "round" : "ellipse"}`);
+            if (iconT === "0.0") console.warn(`[verify] ${label} core=0% — BUG, icon mask all-zero`);
+            if (frameT === fullPct) console.warn(`[verify] ${label} frame==full — BUG, not punched`);
 
             const iconUrl = await persistImage(`data:image/png;base64,${iconBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
             const frameUrl = await persistImage(`data:image/png;base64,${frameBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
@@ -345,6 +396,21 @@ export async function POST(req: Request) {
             const iconAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_core`, type: group.type as any, subType: "core", pngUrl: iconUrl, transparent: true, componentGroupId: group.id, sceneId } });
             const frameAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_frame`, type: group.type as any, subType: "frame", pngUrl: frameUrl, transparent: true, componentGroupId: group.id, sceneId } });
             assets.push(iconAsset, frameAsset);
+
+            // Plus badge extraction
+            if (plusBadgeMask) {
+              const plusPixels = new Uint8Array(rawPixels);
+              for (let y = 0; y < th; y++) {
+                for (let x = 0; x < tw; x++) {
+                  const pi = (y * tw + x) * bpp;
+                  if (plusBadgeMask[y * tw + x] < 128) plusPixels[pi + 3] = 0;
+                }
+              }
+              const plusBuffer = await sharp.default(plusPixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
+              const plusUrl = await persistImage(`data:image/png;base64,${plusBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_plus`);
+              const plusAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_plus`, type: group.type as any, subType: "plus", pngUrl: plusUrl, transparent: true, componentGroupId: group.id, sceneId } });
+              assets.push(plusAsset);
+            }
           }
 
           const mainPngUrl = await persistImage(`data:image/png;base64,${cleanPng.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}`);

@@ -98,74 +98,117 @@ export class GeminiProvider implements ImageAIProvider {
 
   async extractLayers(input: ExtractInput): Promise<LayerResult> {
     const imgBuffer = await this.fetchImageForSegmentation(input.imageUrl);
-    const base64Image = imgBuffer.toString("base64");
+    const sharp = await import("sharp");
+    const imgMeta = await sharp.default(imgBuffer).metadata();
+    const W = imgMeta.width || 1024;
+    const H = imgMeta.height || 576;
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
+    // 5 zones: TOP, LEFT, RIGHT, CENTER, BOTTOM
+    const zones: { name: string; x: number; y: number; w: number; h: number; prompt: string }[] = [
+      {
+        name: "TOP",
+        x: 0, y: 0, w: W, h: Math.round(H * 0.12),
+        prompt: `Detect ALL individual UI elements in the TOP strip of this game UI image. Include the avatar in the top-left corner and EACH resource bar (peach/coin/gem/star) — each bar as a separate BAR element including its icon+number+plus button. Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"AVATAR"},{"box_2d":[y1,x1,y2,x2],"label":"BAR"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
+      },
+      {
+        name: "LEFT",
+        x: 0, y: 0, w: Math.round(W * 0.20), h: H,
+        prompt: `Detect ALL round icon buttons on the LEFT side of this game UI image. Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"ICON"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
+      },
+      {
+        name: "RIGHT",
+        x: Math.round(W * 0.80), y: 0, w: Math.round(W * 0.20), h: H,
+        prompt: `Detect ALL round icon buttons on the RIGHT side of this game UI image. Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"ICON"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
+      },
+      {
+        name: "CENTER",
+        x: Math.round(W * 0.20), y: Math.round(H * 0.12), w: Math.round(W * 0.60), h: Math.round(H * 0.76),
+        prompt: `Detect ALL UI elements in the CENTER area of this game UI image. Include the main panel, any large BATTLE button, and any large illustration/character artwork (label as ILLUSTRATION). Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"PANEL"},{"box_2d":[y1,x1,y2,x2],"label":"BUTTON"},{"box_2d":[y1,x1,y2,x2],"label":"ILLUSTRATION"},{"box_2d":[y1,x1,y2,x2],"label":"BADGE"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
+      },
+      {
+        name: "BOTTOM",
+        x: 0, y: Math.round(H * 0.88), w: W, h: Math.round(H * 0.12),
+        prompt: `Detect ALL navigation tab buttons at the BOTTOM of this game UI image. EACH tab is a separate BUTTON (Shop, Heroes, Battle, Character, Gameplay). Also detect any badge icons. Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"BUTTON"},{"box_2d":[y1,x1,y2,x2],"label":"BADGE"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
+      },
+    ];
 
-    const prompt = `Detect ALL individual UI elements in this game UI image (every icon, button, bar, badge, panel, avatar, text label, etc). Do NOT group by type — list each element separately.
-Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"BUTTON"},{"box_2d":[y1,x1,y2,x2],"label":"ICON"}, ...].
-Coordinates normalized 0-1000. Maximum 30 elements. No mask, no extra text.`;
+    const zoneResults = await Promise.all(
+      zones.map(async (zone) => {
+        try {
+          const cropBuffer = await sharp.default(imgBuffer)
+            .extract({ left: zone.x, top: zone.y, width: zone.w, height: zone.h })
+            .png()
+            .toBuffer();
+          const base64 = cropBuffer.toString("base64");
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
 
-    const res = await fetchWithRetry(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          { parts: [{ text: prompt }, { inlineData: { mimeType: "image/png", data: base64Image } }] },
-        ],
-        generationConfig: {
-          temperature: 0,
-          thinkingConfig: { thinkingBudget: 0 },
-          responseMimeType: "application/json",
-        },
-      }),
-    });
+          const res = await fetchWithRetry(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: zone.prompt }, { inlineData: { mimeType: "image/png", data: base64 } }] }],
+              generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: "application/json" },
+            }),
+          });
 
-    if (!res.ok) {
-      const errBody = await res.text();
-      throw new Error(`Gemini segmentation error ${res.status}: ${errBody}`);
-    }
+          if (!res.ok) {
+            console.warn(`[extractLayers] ${zone.name} API error ${res.status}`);
+            return [];
+          }
 
-    const data = await res.json();
-    const textPart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
-    if (!textPart) throw new Error("Gemini segmentation: no text response");
+          const data = await res.json();
+          const textPart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
+          if (!textPart) return [];
 
-    const rawText = textPart.text.trim();
-    console.log(`[extractLayers] raw length=${rawText.length}`);
+          const rawText = textPart.text.trim();
+          let parsed: any;
+          const arrMatch = rawText.match(/\[[\s\S]*\]/);
+          if (arrMatch) {
+            parsed = JSON.parse(arrMatch[0]);
+          } else {
+            const objMatch = rawText.match(/\{[\s\S]*\}/);
+            if (objMatch) parsed = [JSON.parse(objMatch[0])];
+            else return [];
+          }
 
-    let parsed: any;
-    try {
-      const arrMatch = rawText.match(/\[[\s\S]*\]/);
-      if (arrMatch) {
-        parsed = JSON.parse(arrMatch[0]);
-      } else {
-        const objMatch = rawText.match(/\{[\s\S]*\}/);
-        if (objMatch) {
-          parsed = [JSON.parse(objMatch[0])];
-        } else {
-          throw new Error("No JSON found");
+          if (!Array.isArray(parsed)) parsed = [parsed];
+
+          // Offset coordinates back to full image, filter invalid
+          return parsed
+            .filter((s: any) => s.box_2d && Array.isArray(s.box_2d) && s.box_2d.length === 4 && s.label)
+            .map((s: any) => ({
+              box2d: [
+                s.box_2d[0] / 1000 * zone.h + zone.y,
+                s.box_2d[1] / 1000 * zone.w + zone.x,
+                s.box_2d[2] / 1000 * zone.h + zone.y,
+                s.box_2d[3] / 1000 * zone.w + zone.x,
+              ] as [number, number, number, number],
+              label: s.label.toUpperCase(),
+              area: ((s.box_2d[2] - s.box_2d[0]) / 1000 * zone.h) * ((s.box_2d[3] - s.box_2d[1]) / 1000 * zone.w),
+            }));
+        } catch (e) {
+          console.warn(`[extractLayers] ${zone.name} failed:`, e);
+          return [];
         }
-      }
-    } catch (e) {
-      throw new Error(`Gemini segmentation parse error: ${e instanceof Error ? e.message : e}. Got: ${rawText.slice(0, 300)}`);
-    }
+      })
+    );
 
-    if (!Array.isArray(parsed)) parsed = [parsed];
+    // Flatten all zones
+    const allBoxes = zoneResults.flat();
+    console.log(`[extractLayers] raw boxes: ${allBoxes.length} (zones: ${zones.map((z, i) => `${z.name}=${zoneResults[i].length}`).join(", ")})`);
 
-    // Filter valid boxes
+    // NMS dedup + filtering
     interface Box { box2d: [number, number, number, number]; label: string; area: number }
-    const boxes: Box[] = parsed
-      .filter((s: any) => s.box_2d && Array.isArray(s.box_2d) && s.box_2d.length === 4 && s.label)
-      .map((s: any) => ({
-        box2d: s.box_2d as [number, number, number, number],
-        label: s.label.toUpperCase(),
-        area: (s.box_2d[2] - s.box_2d[0]) * (s.box_2d[3] - s.box_2d[1]),
-      }));
-
-    // NMS dedup: merge boxes with IoU > 0.6
     const nmsed: Box[] = [];
-    boxes.sort((a, b) => b.area - a.area);
-    for (const box of boxes) {
+    allBoxes.sort((a, b) => b.area - a.area);
+
+    for (const box of allBoxes) {
+      // Filter tiny (<0.8%) or too large (>70%) — except BACKGROUND/ILLUSTRATION
+      const fullArea = W * H;
+      const pct = box.area / fullArea;
+      if (pct < 0.008 && !["ILLUSTRATION"].includes(box.label)) continue;
+      if (pct > 0.70 && !["BACKGROUND", "ILLUSTRATION"].includes(box.label)) continue;
+
       let merged = false;
       for (const kept of nmsed) {
         const iou = computeIoU(box.box2d, kept.box2d);
@@ -183,19 +226,14 @@ Coordinates normalized 0-1000. Maximum 30 elements. No mask, no extra text.`;
       if (!merged) nmsed.push({ ...box });
     }
 
-    // Filter tiny boxes (<1.5% area), cap at 40
-    const filtered = nmsed
-      .filter((b) => b.area > 1.5 * 1.5)
-      .slice(0, 40);
-
-    // Sort by position (row-major), then name by grid position
-    const sorted = filtered.sort((a, b) => {
+    // Sort by position (row-major), cap at 40
+    const sorted = nmsed.sort((a, b) => {
       const rowDiff = a.box2d[0] - b.box2d[0];
       return Math.abs(rowDiff) < 50 ? a.box2d[1] - b.box2d[1] : rowDiff;
-    });
+    }).slice(0, 40);
 
     const nameCounts: Record<string, number> = {};
-    const components = sorted.map((s, idx) => {
+    const components = sorted.map((s) => {
       const baseType = s.label;
       nameCounts[baseType] = (nameCounts[baseType] || 0) + 1;
       const suffix = nameCounts[baseType] > 1 ? `_${nameCounts[baseType]}` : "";
@@ -207,7 +245,7 @@ Coordinates normalized 0-1000. Maximum 30 elements. No mask, no extra text.`;
       };
     });
 
-    console.log(`[extractLayers] ${components.length} elements (from ${boxes.length} raw): ${components.map((c: any) => c.name).join(", ")}`);
+    console.log(`[extractLayers] ${components.length} final: ${components.map((c: any) => c.name).join(", ")}`);
     return { components };
   }
 
