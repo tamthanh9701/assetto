@@ -2,31 +2,33 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getProvider } from "@/lib/ai/registry";
 import { persistImage } from "@/lib/storage";
-import { verifySignature } from "@upstash/qstash/nextjs";
+import { Receiver } from "@upstash/qstash";
 import Replicate from "replicate";
 
 export const maxDuration = 300;
 
-const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN || "" });
+const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN || "", useFileOutput: false });
 
 const MATTING_RETRIES = 2;
 
-async function matteImage(cropBuffer: Buffer, isBackground: boolean): Promise<{ buffer: Buffer; w: number; h: number }> {
-  if (isBackground) {
-    // Background: keep as-is
-    const sharp = await import("sharp");
-    const meta = await sharp.default(cropBuffer).metadata();
-    const w = meta.width || 0, h = meta.height || 0;
-    const buf = await sharp.default(cropBuffer, { raw: { width: w, height: h, channels: 4 } }).png().toBuffer();
-    return { buffer: buf, w, h };
-  }
+const receiver = new Receiver({
+  currentSigningKey: process.env.QSTASH_CURRENT_SIGNING_KEY || "",
+  nextSigningKey: process.env.QSTASH_NEXT_SIGNING_KEY || "",
+});
 
+async function matteImage(cropBuffer: Buffer, isBackground: boolean): Promise<{ buffer: Buffer; w: number; h: number }> {
   const sharp = await import("sharp");
   let meta = await sharp.default(cropBuffer).metadata();
   let w = meta.width || 0, h = meta.height || 0;
 
-  // Try Replicate BiRefNet for matting
+  if (isBackground) {
+    const buf = await sharp.default(cropBuffer, { raw: { width: w, height: h, channels: 4 } }).png().toBuffer();
+    return { buffer: buf, w, h };
+  }
+
   let matted: Buffer | null = null;
+  let method = "fallback";
+
   for (let attempt = 0; attempt <= MATTING_RETRIES; attempt++) {
     try {
       const inputBase64 = (await sharp.default(cropBuffer, { raw: { width: w, height: h, channels: 4 } }).png().toBuffer()).toString("base64");
@@ -37,10 +39,16 @@ async function matteImage(cropBuffer: Buffer, isBackground: boolean): Promise<{ 
         { input: { image: dataUrl } }
       );
 
-      if (output && typeof output === "string") {
-        const res = await fetch(output);
+      let url: string | null = null;
+      if (typeof output === "string") url = output;
+      else if (Array.isArray(output)) url = typeof output[0] === "string" ? output[0] : null;
+      else if (output && typeof (output as any).url === "function") url = (output as any).url();
+
+      if (url) {
+        const res = await fetch(url);
         if (res.ok) {
           matted = Buffer.from(await res.arrayBuffer());
+          method = "birefnet";
           break;
         }
       }
@@ -324,19 +332,26 @@ async function getOrCreateGroup(sceneId: string, type: string, order: number) {
 }
 
 export async function POST(req: Request) {
-  // Verify: QStash signature OR x-worker-secret header
-  const authHeader = req.headers.get("x-worker-secret") || req.headers.get("authorization") || "";
-  const qstashSig = req.headers.get("upstash-signature") || "";
-  const isQStash = qstashSig.length > 0;
-  const isDirect = authHeader === process.env.WORKER_SECRET;
-
-  if (!isQStash && !isDirect) {
-    console.warn("[worker] unauthorized access attempt");
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const startTime = Date.now();
   let jobId: string | null = null;
+
   try {
-    const body = await req.json();
+    // Verify: QStash signature OR x-worker-secret
+    const bodyText = await req.text();
+    const qstashSig = req.headers.get("upstash-signature") || "";
+    const directSecret = req.headers.get("x-worker-secret") || "";
+
+    const isQStash = qstashSig.length > 0 && await receiver
+      .verify({ signature: qstashSig, body: bodyText })
+      .catch(() => false);
+    const isDirect = directSecret === process.env.WORKER_SECRET;
+
+    if (!isQStash && !isDirect) {
+      console.warn("[worker] unauthorized access attempt");
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const body = JSON.parse(bodyText);
     jobId = body.jobId;
     if (!jobId) return NextResponse.json({ error: "jobId required" }, { status: 400 });
 
@@ -348,6 +363,10 @@ export async function POST(req: Request) {
 
     const { imageUrl } = job.metadata as { imageUrl: string };
     const sceneId = job.sceneId!;
+
+    // Clean up old assets before re-extracting
+    await prisma.asset.deleteMany({ where: { sceneId } });
+    await prisma.componentGroup.deleteMany({ where: { sceneId } });
 
     await prisma.job.update({ where: { id: jobId }, data: { status: "processing", progress: 0 } });
 
@@ -367,6 +386,7 @@ export async function POST(req: Request) {
     const CONCURRENCY = 5;
     const results: any[] = [];
     let processedCount = 0;
+    let birefnetCount = 0;
 
     for (let batchStart = 0; batchStart < allElements.length; batchStart += CONCURRENCY) {
       const batch = allElements.slice(batchStart, batchStart + CONCURRENCY);
@@ -475,6 +495,15 @@ export async function POST(req: Request) {
       });
     }
 
+    if (results.length === 0) {
+      await prisma.job.update({
+        where: { id: jobId },
+        data: { status: "failed", error: "0 components extracted — all processing failed" },
+      });
+      console.error(`[worker] 0 components for job ${jobId}`);
+      return NextResponse.json({ error: "No components extracted" }, { status: 500 });
+    }
+
     // Create ZIP of all scene assets
     const sceneAssets = await prisma.asset.findMany({
       where: { sceneId },
@@ -512,11 +541,12 @@ export async function POST(req: Request) {
     } else {
       await prisma.job.update({
         where: { id: jobId },
-        data: { status: "completed", progress: 100 },
+        data: { status: "failed", error: "0 assets in ZIP" },
       });
     }
 
-    console.log(`[worker] ${results.length} components extracted for job ${jobId}`);
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[worker] ${results.length} components, ${birefnetCount} matted via BiRefNet, ${duration}s for job ${jobId}`);
     return NextResponse.json({ components: results.length });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
