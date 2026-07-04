@@ -16,14 +16,14 @@ const receiver = new Receiver({
   nextSigningKey: process.env.QSTASH_NEXT_SIGNING_KEY || "",
 });
 
-async function matteImage(cropBuffer: Buffer, isBackground: boolean): Promise<{ buffer: Buffer; w: number; h: number }> {
+async function matteImage(cropBuffer: Buffer, isBackground: boolean): Promise<{ buffer: Buffer; w: number; h: number; method: string }> {
   const sharp = await import("sharp");
   let meta = await sharp.default(cropBuffer).metadata();
   let w = meta.width || 0, h = meta.height || 0;
 
   if (isBackground) {
     const buf = await sharp.default(cropBuffer, { raw: { width: w, height: h, channels: 4 } }).png().toBuffer();
-    return { buffer: buf, w, h };
+    return { buffer: buf, w, h, method: "background" };
   }
 
   let matted: Buffer | null = null;
@@ -62,7 +62,7 @@ async function matteImage(cropBuffer: Buffer, isBackground: boolean): Promise<{ 
       .resize(w, h, { fit: "fill" })
       .png()
       .toBuffer();
-    return { buffer: resized, w, h };
+    return { buffer: resized, w, h, method };
   }
 
   // Fallback: chroma-key
@@ -109,7 +109,69 @@ async function matteImage(cropBuffer: Buffer, isBackground: boolean): Promise<{ 
 
   const buf = await sharp.default(keyed, { raw: { width: w, height: h, channels: 4 } }).trim().png().toBuffer();
   const trimmed = await sharp.default(buf).metadata();
-  return { buffer: buf, w: trimmed.width || w, h: trimmed.height || h };
+  return { buffer: buf, w: trimmed.width || w, h: trimmed.height || h, method: "chromaKey" };
+}
+
+const SAM_RETRIES = 1;
+
+async function splitWithSAM(cleanPng: Buffer, w: number, h: number): Promise<{ iconMask: Uint8Array; frameMask: Uint8Array; samUsed: boolean }> {
+  const sharp = await import("sharp");
+  const rawPixels = await sharp.default(cleanPng).ensureAlpha().raw().toBuffer();
+  const bpp = 4;
+
+  // Default: icon mask from SAM; fallback: splitLocal
+  let iconMask: Uint8Array | null = null;
+
+  for (let attempt = 0; attempt <= SAM_RETRIES; attempt++) {
+    try {
+      const inputBase64 = (await sharp.default(cleanPng).png().toBuffer()).toString("base64");
+      const dataUrl = `data:image/png;base64,${inputBase64}`;
+
+      // Point prompt at center of crop
+      const cx = Math.round((50 / 100) * 1000); // normalized 0-1000
+      const cy = Math.round((50 / 100) * 1000);
+      const points = [[cx, cy, 1]]; // [x, y, label=1 (foreground)]
+
+      const output = await replicate.run(
+        "sczhou/sam-2:0ebdd59f4ef3c7b3e0cf95f66c2bfa6ffd6cae4b15b5c8f1a8f4e7e4e4e4e4e4",
+        { input: { image: dataUrl, point_coords: JSON.stringify(points), point_labels: "1" } }
+      );
+
+      let maskUrl: string | null = null;
+      if (typeof output === "string") maskUrl = output;
+      else if (Array.isArray(output)) maskUrl = typeof output[0] === "string" ? output[0] : null;
+      else if (output && typeof (output as any).url === "function") maskUrl = (output as any).url();
+
+      if (maskUrl) {
+        const res = await fetch(maskUrl);
+        if (res.ok) {
+          const maskBuf = Buffer.from(await res.arrayBuffer());
+          const resized = await sharp.default(maskBuf).resize(w, h, { fit: "fill" }).grayscale().raw().toBuffer();
+          iconMask = new Uint8Array(resized);
+          break;
+        }
+      }
+    } catch (e) {
+      console.warn(`[sam] attempt ${attempt} failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+
+  if (iconMask) {
+    // Threshold SAM output
+    for (let i = 0; i < w * h; i++) iconMask[i] = iconMask[i] > 128 ? 255 : 0;
+
+    const frameMask = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      const pi = i * bpp;
+      if (rawPixels[pi + 3] > 100 && iconMask[i] === 0) frameMask[i] = 255;
+    }
+    return { iconMask, frameMask, samUsed: true };
+  }
+
+  // Fallback: splitLocal
+  console.warn("[sam] SAM failed, fallback to splitLocal");
+  const fallback = splitLocal(rawPixels, w, h, true);
+  return { iconMask: fallback.iconMask, frameMask: fallback.frameMask, samUsed: false };
 }
 
 function clamp(v: number, min: number, max: number): number {
@@ -387,6 +449,7 @@ export async function POST(req: Request) {
     const results: any[] = [];
     let processedCount = 0;
     let birefnetCount = 0;
+    let samCount = 0;
 
     for (let batchStart = 0; batchStart < allElements.length; batchStart += CONCURRENCY) {
       const batch = allElements.slice(batchStart, batchStart + CONCURRENCY);
@@ -417,15 +480,17 @@ export async function POST(req: Request) {
           const ch = clamp(Math.round(((seg.box2d[2] - seg.box2d[0]) / 1000) * H), 1, H - top);
 
           let cropBuffer = await sharp.default(imgBuffer).extract({ left, top, width: cw, height: ch }).ensureAlpha().raw().toBuffer();
-          const { buffer: mattedBuffer, w: tw, h: th } = await matteImage(cropBuffer, type === "BACKGROUND");
+          const { buffer: mattedBuffer, w: tw, h: th, method } = await matteImage(cropBuffer, type === "BACKGROUND");
           const cleanPng = mattedBuffer;
+          if (method === "birefnet") birefnetCount++;
 
           const group = await getOrCreateGroup(sceneId, type, batchStart + batch.indexOf(seg));
           const assets: any[] = [];
 
           if (shouldSplit) {
             const rawPixels = await sharp.default(cleanPng).ensureAlpha().raw().toBuffer();
-            const { iconMask, frameMask, plusBadgeMask } = splitLocal(rawPixels, tw, th, isRound);
+            const { iconMask, frameMask, samUsed } = await splitWithSAM(cleanPng, tw, th);
+            if (samUsed) samCount++;
             const bpp = 4;
 
             let fullOpaque = 0;
@@ -454,7 +519,7 @@ export async function POST(req: Request) {
 
             const iconT = ((tw * th - iconOpaque) / (tw * th) * 100).toFixed(1);
             const frameT = ((tw * th - frameOpaque) / (tw * th) * 100).toFixed(1);
-            console.log(`[worker] ${label} core=${iconT}% frame=${frameT}% full=${fullPct}% method=${isRound ? "round" : "ellipse"}`);
+            console.log(`[worker] ${label} core=${iconT}% frame=${frameT}% full=${fullPct}% split=${samUsed ? "SAM" : "local"}`);
 
             const iconUrl = await persistImage(`data:image/png;base64,${iconBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_core`);
             const frameUrl = await persistImage(`data:image/png;base64,${frameBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
@@ -462,17 +527,44 @@ export async function POST(req: Request) {
             const frameAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_frame`, type: group.type as any, subType: "frame", pngUrl: frameUrl, transparent: true, componentGroupId: group.id, sceneId } });
             assets.push(iconAsset, frameAsset);
 
-            if (plusBadgeMask) {
+            // Plus badge detection
+            const qw = Math.round(tw * 0.35);
+            const qh = Math.round(th * 0.35);
+            let hasRed = false;
+            for (let y = 0; y < qh && y < th; y++) {
+              for (let x = tw - qw; x < tw; x++) {
+                const pi = (y * tw + x) * bpp;
+                if (rawPixels[pi + 3] > 128 && rawPixels[pi] > 180 && rawPixels[pi + 1] < 100 && rawPixels[pi + 2] < 100) { hasRed = true; break; }
+              }
+              if (hasRed) break;
+            }
+            if (hasRed) {
               const plusPixels = new Uint8Array(rawPixels);
-              for (let y = 0; y < th; y++) {
-                for (let x = 0; x < tw; x++) {
-                  if (plusBadgeMask[y * tw + x] < 128) plusPixels[(y * tw + x) * bpp + 3] = 0;
+              for (let y = 0; y < qh && y < th; y++) {
+                for (let x = tw - qw; x < tw; x++) {
+                  const i = y * tw + x;
+                  const pi = i * bpp;
+                  if (rawPixels[pi + 3] > 128 && rawPixels[pi] > 180 && rawPixels[pi + 1] < 100 && rawPixels[pi + 2] < 100) {
+                    plusPixels[pi + 3] = 0;
+                    // Also punch from frame
+                    framePixels[pi + 3] = 0;
+                  } else {
+                    plusPixels[pi + 3] = 0;
+                  }
                 }
               }
               const plusBuffer = await sharp.default(plusPixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
               const plusUrl = await persistImage(`data:image/png;base64,${plusBuffer.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_plus`);
               const plusAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_plus`, type: group.type as any, subType: "plus", pngUrl: plusUrl, transparent: true, componentGroupId: group.id, sceneId } });
               assets.push(plusAsset);
+
+              // Re-upload frame with plus punched out
+              const fixedFrame = await sharp.default(framePixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
+              const fixedFrameUrl = await persistImage(`data:image/png;base64,${fixedFrame.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
+              await prisma.asset.updateMany({
+                where: { sceneId, name: `${label}_${sceneId.slice(0, 6)}_frame` },
+                data: { pngUrl: fixedFrameUrl },
+              });
             }
           }
 
@@ -546,7 +638,7 @@ export async function POST(req: Request) {
     }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[worker] ${results.length} components, ${birefnetCount} matted via BiRefNet, ${duration}s for job ${jobId}`);
+    console.log(`[worker] ${results.length} components, ${birefnetCount} matted via BiRefNet, ${samCount} split via SAM, ${duration}s for job ${jobId}`);
     return NextResponse.json({ components: results.length });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
