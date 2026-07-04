@@ -568,10 +568,8 @@ export async function POST(req: Request) {
               // Re-upload frame with plus punched out
               const fixedFrame = await sharp.default(framePixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
               const fixedFrameUrl = await persistImage(`data:image/png;base64,${fixedFrame.toString("base64")}`, `comp_${sceneId.slice(0, 6)}_${label}_frame`);
-              await prisma.asset.updateMany({
-                where: { sceneId, name: `${label}_${sceneId.slice(0, 6)}_frame` },
-                data: { pngUrl: fixedFrameUrl },
-              });
+              const frameAsset = await prisma.asset.create({ data: { name: `${label}_${sceneId.slice(0, 6)}_frame`, type: group.type as any, subType: "frame", pngUrl: fixedFrameUrl, transparent: true, componentGroupId: group.id, sceneId } });
+              assets.push(frameAsset);
             } else {
               // No plus badge — save frame as-is
               const frameBuffer = await sharp.default(framePixels, { raw: { width: tw, height: th, channels: 4 } }).trim().png().toBuffer();
