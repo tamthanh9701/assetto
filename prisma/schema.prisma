@@ -139,6 +139,19 @@ model Asset {
   updatedAt       DateTime  @updatedAt
 }
 
+model Job {
+  id            String   @id @default(cuid())
+  sceneId       String?
+  type          String   @default("extract")
+  status        String   @default("pending")
+  progress      Int      @default(0)
+  resultZipUrl  String?
+  error         String?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
 model Generation {
   id        String   @id @default(cuid())
   status    String   @default("pending")
