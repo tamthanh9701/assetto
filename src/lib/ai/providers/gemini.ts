@@ -52,6 +52,9 @@ export class GeminiProvider implements ImageAIProvider {
         generationConfig: {
           responseModalities: ["Text", "Image"],
           ...(input.seed ? { seed: input.seed } : {}),
+          imageConfig: {
+            aspectRatio: input.ratio || "9:16",
+          },
         },
       }),
     });

@@ -41,7 +41,7 @@ export default function GeneratePage() {
   const searchParams = useSearchParams();
   const [prompt, setPrompt] = useState("");
   const [sceneType, setSceneType] = useState("MENU");
-  const [ratio, setRatio] = useState("16:9");
+  const [ratio, setRatio] = useState("9:16");
   const [quality, setQuality] = useState("standard");
   const [projectId, setProjectId] = useState<string>(
     searchParams.get("projectId") || ""
@@ -206,10 +206,12 @@ export default function GeneratePage() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="16:9">16:9 (Landscape)</SelectItem>
                         <SelectItem value="9:16">9:16 (Portrait)</SelectItem>
-                        <SelectItem value="4:3">4:3</SelectItem>
+                        <SelectItem value="16:9">16:9 (Landscape)</SelectItem>
                         <SelectItem value="1:1">1:1 (Square)</SelectItem>
+                        <SelectItem value="4:3">4:3</SelectItem>
+                        <SelectItem value="3:4">3:4</SelectItem>
+                        <SelectItem value="21:9">21:9 (Ultrawide)</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
