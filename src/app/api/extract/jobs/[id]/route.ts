@@ -20,7 +20,7 @@ export async function GET(
     return NextResponse.json({ error: "Job not found" }, { status: 404 });
   }
 
-  const assets = job.sceneId
+  const rawAssets = job.sceneId
     ? await prisma.asset.findMany({
         where: { sceneId: job.sceneId, scene: { project: { userId: session.user.id } } },
         orderBy: [{ order: "asc" }, { createdAt: "asc" }],
@@ -37,6 +37,12 @@ export async function GET(
         },
       })
     : [];
+
+  const assets = rawAssets.map((asset) => ({
+    ...asset,
+    assetType: asset.type,
+    type: asset.componentGroup?.type || asset.type,
+  }));
 
   return NextResponse.json({
     id: job.id,
