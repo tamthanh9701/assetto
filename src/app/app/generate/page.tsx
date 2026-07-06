@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -10,7 +10,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -36,8 +35,38 @@ const sceneTypes = [
   { value: "CUSTOM", label: "Custom" },
 ];
 
+type ProjectOption = { id: string; name: string };
+
+type SceneResult = {
+  id: string;
+  imageUrl: string;
+  prompt: string;
+};
+
+type ExtractAsset = {
+  id: string;
+  name: string;
+  type: string;
+  subType?: string | null;
+  pngUrl: string | null;
+  transparent?: boolean;
+};
+
+type ExtractJob = {
+  id: string;
+  sceneId?: string | null;
+  status: "pending" | "processing" | "completed" | "failed" | string;
+  progress: number;
+  resultZipUrl?: string | null;
+  error?: string | null;
+  assets?: ExtractAsset[];
+};
+
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export default function GeneratePage() {
-  const router = useRouter();
   const searchParams = useSearchParams();
   const [prompt, setPrompt] = useState("");
   const [sceneType, setSceneType] = useState("MENU");
@@ -46,17 +75,12 @@ export default function GeneratePage() {
   const [projectId, setProjectId] = useState<string>(
     searchParams.get("projectId") || ""
   );
-  const [projects, setProjects] = useState<{ id: string; name: string }[]>([]);
+  const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [generating, setGenerating] = useState(false);
-  const [sceneResult, setSceneResult] = useState<{
-    id: string;
-    imageUrl: string;
-    prompt: string;
-  } | null>(null);
+  const [sceneResult, setSceneResult] = useState<SceneResult | null>(null);
   const [extracting, setExtracting] = useState(false);
-  const [components, setComponents] = useState<
-    { name: string; type: string; imageUrl: string }[]
-  >([]);
+  const [extractJob, setExtractJob] = useState<ExtractJob | null>(null);
+  const [components, setComponents] = useState<ExtractAsset[]>([]);
 
   useEffect(() => {
     fetch("/api/projects")
@@ -70,8 +94,10 @@ export default function GeneratePage() {
       toast.error("Please select a project");
       return;
     }
+
     setGenerating(true);
     setSceneResult(null);
+    setExtractJob(null);
     setComponents([]);
 
     try {
@@ -80,19 +106,54 @@ export default function GeneratePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt, type: sceneType, ratio, quality, projectId }),
       });
-      if (!res.ok) throw new Error("Generation failed");
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || "Generation failed");
+      }
       const data = await res.json();
       setSceneResult(data);
       toast.success("Scene generated!");
-    } catch {
-      toast.error("Failed to generate scene");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to generate scene");
+    } finally {
+      setGenerating(false);
     }
-    setGenerating(false);
+  }
+
+  async function pollExtractJob(jobId: string) {
+    for (let attempt = 0; attempt < 180; attempt++) {
+      const res = await fetch(`/api/extract/jobs/${jobId}`, { cache: "no-store" });
+      if (!res.ok) {
+        throw new Error("Failed to read extraction job");
+      }
+
+      const job: ExtractJob = await res.json();
+      setExtractJob(job);
+
+      if (job.status === "completed") {
+        const assets = (job.assets || []).filter((asset) => Boolean(asset.pngUrl));
+        setComponents(assets);
+        toast.success(`Extracted ${assets.length} assets`);
+        return;
+      }
+
+      if (job.status === "failed") {
+        throw new Error(job.error || "Extraction failed");
+      }
+
+      await wait(2000);
+    }
+
+    throw new Error("Extraction is still running. Please refresh the job status later.");
   }
 
   async function extractLayers() {
     if (!sceneResult) return;
+
     setExtracting(true);
+    setExtractJob(null);
+    setComponents([]);
+
     try {
       const res = await fetch("/api/extract", {
         method: "POST",
@@ -102,22 +163,28 @@ export default function GeneratePage() {
           imageUrl: sceneResult.imageUrl,
         }),
       });
-      if (!res.ok) throw new Error("Extraction failed");
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || "Extraction failed");
+      }
       const data = await res.json();
-      setComponents(data.components);
-      toast.success("Layers extracted!");
-    } catch {
-      toast.error("Failed to extract layers");
+      setExtractJob({ id: data.jobId, status: data.status, progress: 0 });
+      await pollExtractJob(data.jobId);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to extract layers");
+    } finally {
+      setExtracting(false);
     }
-    setExtracting(false);
   }
+
+  const progress = extractJob?.progress ?? 0;
 
   return (
     <div className="p-8 max-w-4xl mx-auto">
       <div className="mb-8">
         <h1 className="text-3xl font-bold">Generate Scene</h1>
         <p className="text-muted-foreground">
-          Create a new game UI scene with AI.
+          Create a new game UI scene with AI, extract reusable assets, and export PNG/ZIP files.
         </p>
       </div>
 
@@ -127,19 +194,11 @@ export default function GeneratePage() {
             <Sparkles className="w-4 h-4" />
             Generate
           </TabsTrigger>
-          <TabsTrigger
-            value="extract"
-            className="gap-2"
-            disabled={!sceneResult}
-          >
+          <TabsTrigger value="extract" className="gap-2" disabled={!sceneResult}>
             <Layers className="w-4 h-4" />
             Extract Layers
           </TabsTrigger>
-          <TabsTrigger
-            value="export"
-            className="gap-2"
-            disabled={components.length === 0}
-          >
+          <TabsTrigger value="export" className="gap-2" disabled={components.length === 0}>
             <Download className="w-4 h-4" />
             Export
           </TabsTrigger>
@@ -230,15 +289,10 @@ export default function GeneratePage() {
                   </div>
                 </div>
 
-                <Button
-                  type="submit"
-                  className="w-full gap-2"
-                  disabled={generating}
-                >
+                <Button type="submit" className="w-full gap-2" disabled={generating}>
                   {generating ? (
                     <>
-                      <Loader2 className="w-4 h-4 animate-spin" />{" "}
-                      Generating...
+                      <Loader2 className="w-4 h-4 animate-spin" /> Generating...
                     </>
                   ) : (
                     <>
@@ -254,9 +308,7 @@ export default function GeneratePage() {
             <Card className="mt-6">
               <CardHeader>
                 <CardTitle>Generated Scene</CardTitle>
-                <CardDescription>
-                  {sceneResult.prompt.slice(0, 100)}
-                </CardDescription>
+                <CardDescription>{sceneResult.prompt.slice(0, 100)}</CardDescription>
               </CardHeader>
               <CardContent>
                 <div className="relative aspect-video rounded-lg overflow-hidden bg-muted">
@@ -276,19 +328,14 @@ export default function GeneratePage() {
             <CardHeader>
               <CardTitle>Extract Layers</CardTitle>
               <CardDescription>
-                Separate the scene into individual components.
+                Run the async extraction worker, track progress, and load extracted assets when done.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              <Button
-                onClick={extractLayers}
-                disabled={extracting || !sceneResult}
-                className="gap-2"
-              >
+              <Button onClick={extractLayers} disabled={extracting || !sceneResult} className="gap-2">
                 {extracting ? (
                   <>
-                    <Loader2 className="w-4 h-4 animate-spin" />{" "}
-                    Extracting...
+                    <Loader2 className="w-4 h-4 animate-spin" /> Extracting...
                   </>
                 ) : (
                   <>
@@ -297,24 +344,38 @@ export default function GeneratePage() {
                 )}
               </Button>
 
+              {extractJob && (
+                <div className="space-y-2 rounded-lg border p-4">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-medium">Status: {extractJob.status}</span>
+                    <span>{progress}%</span>
+                  </div>
+                  <div className="h-2 rounded-full bg-muted overflow-hidden">
+                    <div className="h-full bg-primary transition-all" style={{ width: `${progress}%` }} />
+                  </div>
+                  {extractJob.error && <p className="text-sm text-destructive">{extractJob.error}</p>}
+                </div>
+              )}
+
               {components.length > 0 && (
                 <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mt-4">
-                  {components.map((comp, i) => (
-                    <Card key={i}>
+                  {components.map((comp) => (
+                    <Card key={comp.id}>
                       <CardContent className="p-3">
                         <div className="aspect-square rounded-md overflow-hidden bg-muted mb-2">
-                          <img
-                            src={comp.imageUrl}
-                            alt={comp.name}
-                            className="w-full h-full object-contain"
-                          />
+                          {comp.pngUrl && (
+                            <img
+                              src={comp.pngUrl}
+                              alt={comp.name}
+                              className="w-full h-full object-contain"
+                            />
+                          )}
                         </div>
-                        <p className="text-sm font-medium truncate">
-                          {comp.name}
-                        </p>
-                        <Badge variant="secondary" className="mt-1">
-                          {comp.type}
-                        </Badge>
+                        <p className="text-sm font-medium truncate">{comp.name}</p>
+                        <div className="flex gap-1 mt-1">
+                          <Badge variant="secondary">{comp.type}</Badge>
+                          {comp.subType && <Badge variant="outline">{comp.subType}</Badge>}
+                        </div>
                       </CardContent>
                     </Card>
                   ))}
@@ -329,7 +390,7 @@ export default function GeneratePage() {
             <CardHeader>
               <CardTitle>Export Assets</CardTitle>
               <CardDescription>
-                Download your components as transparent PNGs.
+                Download extracted components as transparent PNGs or as a ZIP archive.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -349,37 +410,25 @@ export default function GeneratePage() {
                 </Button>
               </div>
               <div className="space-y-2">
-                {components.map((comp, i) => (
-                  <div
-                    key={i}
-                    className="flex items-center justify-between p-3 rounded-lg border"
-                  >
+                {components.map((comp) => (
+                  <div key={comp.id} className="flex items-center justify-between p-3 rounded-lg border">
                     <div className="flex items-center gap-3">
                       <div className="w-10 h-10 rounded bg-muted overflow-hidden">
-                        <img
-                          src={comp.imageUrl}
-                          alt={comp.name}
-                          className="w-full h-full object-contain"
-                        />
+                        {comp.pngUrl && (
+                          <img src={comp.pngUrl} alt={comp.name} className="w-full h-full object-contain" />
+                        )}
                       </div>
                       <div>
                         <p className="text-sm font-medium">{comp.name}</p>
                         <p className="text-xs text-muted-foreground">
-                          {comp.type}
+                          {comp.type}{comp.subType ? ` / ${comp.subType}` : ""}
                         </p>
                       </div>
                     </div>
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => {
-                        const assetId = comp.imageUrl.split("/").pop()?.split(".")[0];
-                        if (assetId) {
-                          window.open(`/api/export?assetId=${assetId}`, "_blank");
-                        } else {
-                          window.open(comp.imageUrl, "_blank");
-                        }
-                      }}
+                      onClick={() => window.open(`/api/export?assetId=${comp.id}`, "_blank")}
                     >
                       <Download className="w-4 h-4 mr-1" /> Download
                     </Button>
