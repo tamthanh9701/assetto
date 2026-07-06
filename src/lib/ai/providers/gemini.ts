@@ -3,6 +3,35 @@ import { ImageAIProvider, SceneInput, GenResult, ExtractInput, LayerResult, BgIn
 const IMAGE_GEN_MODEL = "gemini-2.5-flash-image";
 const SEGMENTATION_MODEL = "gemini-2.5-flash";
 
+const ALLOWED_TYPES = new Set([
+  "BACKGROUND",
+  "PANEL",
+  "BUTTON",
+  "ICON",
+  "BAR",
+  "BADGE",
+  "CHARACTER",
+  "SPRITE",
+  "CUSTOM",
+]);
+
+interface SegmentationBox {
+  box_2d?: [number, number, number, number];
+  mask?: string;
+  label?: string;
+  type?: string;
+  name?: string;
+  confidence?: number;
+}
+
+interface NormalizedComponent {
+  name: string;
+  type: string;
+  imageUrl: string;
+  box2d: [number, number, number, number];
+  confidence?: number;
+}
+
 async function fetchWithRetry(
   url: string,
   options: RequestInit,
@@ -19,10 +48,29 @@ async function fetchWithRetry(
   return fetch(url, options);
 }
 
-interface SegmentationBox {
-  box_2d?: [number, number, number, number];
-  mask?: string;
-  label?: string;
+function normalizeLabel(value?: string): string {
+  const label = (value || "CUSTOM").toUpperCase().replace(/[^A-Z_]/g, "_");
+  if (label === "ILLUSTRATION") return "CHARACTER";
+  if (ALLOWED_TYPES.has(label)) return label;
+  return "CUSTOM";
+}
+
+function normalizeBox(box: unknown): [number, number, number, number] | null {
+  if (!Array.isArray(box) || box.length !== 4) return null;
+  const values = box.map((v) => Number(v));
+  if (values.some((v) => !Number.isFinite(v))) return null;
+
+  let [y1, x1, y2, x2] = values;
+  y1 = Math.max(0, Math.min(1000, y1));
+  x1 = Math.max(0, Math.min(1000, x1));
+  y2 = Math.max(0, Math.min(1000, y2));
+  x2 = Math.max(0, Math.min(1000, x2));
+
+  if (y2 < y1) [y1, y2] = [y2, y1];
+  if (x2 < x1) [x1, x2] = [x2, x1];
+
+  if (y2 - y1 < 6 || x2 - x1 < 6) return null;
+  return [y1, x1, y2, x2];
 }
 
 function computeIoU(a: [number, number, number, number], b: [number, number, number, number]): number {
@@ -34,7 +82,48 @@ function computeIoU(a: [number, number, number, number], b: [number, number, num
   const inter = iw * ih;
   const areaA = (ax2 - ax1) * (ay2 - ay1);
   const areaB = (bx2 - bx1) * (by2 - by1);
-  return inter / (areaA + areaB - inter);
+  return inter / Math.max(1, areaA + areaB - inter);
+}
+
+function parseJsonPayload(rawText: string): any {
+  const cleaned = rawText.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const objectMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (objectMatch) return JSON.parse(objectMatch[0]);
+    const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+    if (arrayMatch) return JSON.parse(arrayMatch[0]);
+    throw new Error(`No JSON payload found in Gemini response: ${rawText.slice(0, 200)}`);
+  }
+}
+
+function coerceElements(parsed: any): SegmentationBox[] {
+  if (Array.isArray(parsed)) return parsed;
+  if (Array.isArray(parsed?.elements)) return parsed.elements;
+  if (Array.isArray(parsed?.components)) return parsed.components;
+  if (parsed?.box_2d) return [parsed];
+  return [];
+}
+
+function nms(components: NormalizedComponent[]): NormalizedComponent[] {
+  const sorted = [...components].sort((a, b) => (b.confidence ?? 0.5) - (a.confidence ?? 0.5));
+  const kept: NormalizedComponent[] = [];
+
+  for (const candidate of sorted) {
+    const duplicate = kept.some((existing) => {
+      const iou = computeIoU(candidate.box2d, existing.box2d);
+      return iou > 0.65 || (candidate.type === existing.type && iou > 0.42);
+    });
+    if (!duplicate) kept.push(candidate);
+  }
+
+  return kept
+    .sort((a, b) => {
+      const rowDiff = a.box2d[0] - b.box2d[0];
+      return Math.abs(rowDiff) < 35 ? a.box2d[1] - b.box2d[1] : rowDiff;
+    })
+    .slice(0, 60);
 }
 
 export class GeminiProvider implements ImageAIProvider {
@@ -56,7 +145,7 @@ export class GeminiProvider implements ImageAIProvider {
           {
             parts: [
               {
-                text: `Generate a game UI scene: ${input.prompt}. Aspect ratio: ${input.ratio || "16:9"}. Clean game UI design with clear sections for background, panels, buttons, icons, bars, and badges.`,
+                text: `Generate a game UI scene: ${input.prompt}. Aspect ratio: ${input.ratio || "16:9"}. Clean game UI design with clear reusable sections for background, panels, buttons, icons, bars, and badges. Avoid merging important UI controls into the background.`,
               },
             ],
           },
@@ -102,159 +191,47 @@ export class GeminiProvider implements ImageAIProvider {
     const imgMeta = await sharp.default(imgBuffer).metadata();
     const W = imgMeta.width || 1024;
     const H = imgMeta.height || 576;
+    const base64Image = imgBuffer.toString("base64");
 
-    // 5 zones: TOP, LEFT, RIGHT, CENTER, BOTTOM
-    const zones: { name: string; x: number; y: number; w: number; h: number; prompt: string }[] = [
-      {
-        name: "TOP",
-        x: 0, y: 0, w: W, h: Math.round(H * 0.12),
-        prompt: `Detect ALL individual UI elements in the TOP strip of this game UI image. Include the avatar in the top-left corner and EACH resource bar (peach/coin/gem/star) — each bar as a separate BAR element including its icon+number+plus button. Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"AVATAR"},{"box_2d":[y1,x1,y2,x2],"label":"BAR"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
-      },
-      {
-        name: "LEFT",
-        x: 0, y: 0, w: Math.round(W * 0.20), h: H,
-        prompt: `Detect ALL round icon buttons on the LEFT side of this game UI image. Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"ICON"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
-      },
-      {
-        name: "RIGHT",
-        x: Math.round(W * 0.80), y: 0, w: Math.round(W * 0.20), h: H,
-        prompt: `Detect ALL round icon buttons on the RIGHT side of this game UI image. Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"ICON"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
-      },
-      {
-        name: "CENTER",
-        x: Math.round(W * 0.20), y: Math.round(H * 0.12), w: Math.round(W * 0.60), h: Math.round(H * 0.76),
-        prompt: `Detect ALL UI elements in the CENTER area of this game UI image. Include the main panel, any large BATTLE button, and any large illustration/character artwork (label as ILLUSTRATION). Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"PANEL"},{"box_2d":[y1,x1,y2,x2],"label":"BUTTON"},{"box_2d":[y1,x1,y2,x2],"label":"ILLUSTRATION"},{"box_2d":[y1,x1,y2,x2],"label":"BADGE"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
-      },
-      {
-        name: "BOTTOM",
-        x: 0, y: Math.round(H * 0.88), w: W, h: Math.round(H * 0.12),
-        prompt: `Detect ALL navigation tab buttons at the BOTTOM of this game UI image. EACH tab is a separate BUTTON (Shop, Heroes, Battle, Character, Gameplay). Also detect any badge icons. Return ONLY a JSON array: [{"box_2d":[y1,x1,y2,x2],"label":"BUTTON"},{"box_2d":[y1,x1,y2,x2],"label":"BADGE"},...]. Coordinates normalized 0-1000 relative to THIS crop. Maximum 10 elements. No mask.`,
-      },
-    ];
+    const globalPrompt = `You are extracting reusable game UI assets from a generated scene.
+Return ONLY valid JSON in this exact shape:
+{"elements":[{"name":"Main Panel","type":"PANEL","box_2d":[y1,x1,y2,x2],"confidence":0.9}]}
+Rules:
+- Coordinates are normalized 0-1000 relative to the FULL image.
+- type must be one of BACKGROUND, PANEL, BUTTON, ICON, BAR, BADGE, CHARACTER, SPRITE, CUSTOM.
+- Detect whole reusable UI components, not text-only labels or tiny decorative pixels.
+- Include separate buttons, icons, bars, badges, panels, character/illustration art, and major sprites.
+- Prefer tight boxes around the visible component. Maximum 50 elements.`;
 
-    const zoneResults = await Promise.all(
-      zones.map(async (zone) => {
-        try {
-          const cropBuffer = await sharp.default(imgBuffer)
-            .extract({ left: zone.x, top: zone.y, width: zone.w, height: zone.h })
-            .png()
-            .toBuffer();
-          const base64 = cropBuffer.toString("base64");
-          const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
+    let components = await this.detectComponents(base64Image, globalPrompt, W, H);
 
-          const res = await fetchWithRetry(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: zone.prompt }, { inlineData: { mimeType: "image/png", data: base64 } }] }],
-              generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: "application/json" },
-            }),
-          });
-
-          if (!res.ok) {
-            console.warn(`[extractLayers] ${zone.name} API error ${res.status}`);
-            return [];
-          }
-
-          const data = await res.json();
-          const textPart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
-          if (!textPart) return [];
-
-          const rawText = textPart.text.trim();
-          let parsed: any;
-          const arrMatch = rawText.match(/\[[\s\S]*\]/);
-          if (arrMatch) {
-            parsed = JSON.parse(arrMatch[0]);
-          } else {
-            const objMatch = rawText.match(/\{[\s\S]*\}/);
-            if (objMatch) parsed = [JSON.parse(objMatch[0])];
-            else return [];
-          }
-
-          if (!Array.isArray(parsed)) parsed = [parsed];
-
-          // Offset coordinates back to full image, filter invalid
-          return parsed
-            .filter((s: any) => s.box_2d && Array.isArray(s.box_2d) && s.box_2d.length === 4 && s.label)
-            .map((s: any) => ({
-              box2d: [
-                s.box_2d[0] / 1000 * zone.h + zone.y,
-                s.box_2d[1] / 1000 * zone.w + zone.x,
-                s.box_2d[2] / 1000 * zone.h + zone.y,
-                s.box_2d[3] / 1000 * zone.w + zone.x,
-              ] as [number, number, number, number],
-              label: s.label.toUpperCase(),
-              area: ((s.box_2d[2] - s.box_2d[0]) / 1000 * zone.h) * ((s.box_2d[3] - s.box_2d[1]) / 1000 * zone.w),
-            }));
-        } catch (e) {
-          console.warn(`[extractLayers] ${zone.name} failed:`, e);
-          return [];
-        }
-      })
-    );
-
-    // Flatten all zones
-    const allBoxes = zoneResults.flat();
-    console.log(`[extractLayers] raw boxes: ${allBoxes.length} (zones: ${zones.map((z, i) => `${z.name}=${zoneResults[i].length}`).join(", ")})`);
-
-    // NMS dedup + filtering
-    interface Box { box2d: [number, number, number, number]; label: string; area: number }
-    const nmsed: Box[] = [];
-    allBoxes.sort((a, b) => b.area - a.area);
-
-    for (const box of allBoxes) {
-      // Filter tiny (<0.8%) or too large (>70%) — except BACKGROUND/ILLUSTRATION
-      const fullArea = W * H;
-      const pct = box.area / fullArea;
-      if (pct < 0.008 && !["ILLUSTRATION"].includes(box.label)) continue;
-      if (pct > 0.70 && !["BACKGROUND", "ILLUSTRATION"].includes(box.label)) continue;
-
-      let merged = false;
-      for (const kept of nmsed) {
-        const iou = computeIoU(box.box2d, kept.box2d);
-        if (iou > 0.6 || (box.label === kept.label && iou > 0.3)) {
-          kept.box2d = [
-            Math.min(box.box2d[0], kept.box2d[0]),
-            Math.min(box.box2d[1], kept.box2d[1]),
-            Math.max(box.box2d[2], kept.box2d[2]),
-            Math.max(box.box2d[3], kept.box2d[3]),
-          ] as [number, number, number, number];
-          merged = true;
-          break;
-        }
-      }
-      if (!merged) nmsed.push({ ...box });
+    if (components.length < 3) {
+      console.warn(`[Gemini extract] global detection returned ${components.length}; running zone fallback`);
+      components = await this.detectByZones(imgBuffer, W, H);
     }
 
-    // Sort by position (row-major), cap at 40
-    const sorted = nmsed.sort((a, b) => {
-      const rowDiff = a.box2d[0] - b.box2d[0];
-      return Math.abs(rowDiff) < 50 ? a.box2d[1] - b.box2d[1] : rowDiff;
-    }).slice(0, 40);
-
-    const nameCounts: Record<string, number> = {};
-    const components = sorted.map((s) => {
-      const baseType = s.label;
-      nameCounts[baseType] = (nameCounts[baseType] || 0) + 1;
-      const suffix = nameCounts[baseType] > 1 ? `_${nameCounts[baseType]}` : "";
-      return {
-        name: baseType.charAt(0) + baseType.slice(1).toLowerCase() + suffix,
-        type: baseType,
+    const withBackground: NormalizedComponent[] = [
+      {
+        name: "Background",
+        type: "BACKGROUND",
         imageUrl: "",
-        box2d: s.box2d,
-      };
-    });
+        box2d: [0, 0, 1000, 1000],
+        confidence: 1,
+      },
+      ...components,
+    ];
 
-    console.log(`[extractLayers] ${components.length} final: ${components.map((c: any) => c.name).join(", ")}`);
-    return { components };
+    const finalComponents = nms(withBackground);
+    console.log(`[Gemini extract] ${finalComponents.length} components: ${finalComponents.map((c) => `${c.type}:${c.name}`).join(", ")}`);
+
+    return { components: finalComponents };
   }
 
   async removeBackground(input: BgInput): Promise<PngResult> {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
-
     const prompt = `Segment the main subject of this image. Return a JSON object with:
 {"box_2d": [y1, x1, y2, x2], "mask": "<base64 PNG grayscale mask, white=subject, black=background>"}
-Coordinates 0–1000. Return ONLY the JSON, no other text.`;
+Coordinates 0-1000. Return ONLY the JSON, no other text.`;
 
     const imgBuffer = await this.fetchImageForSegmentation(input.imageUrl);
     const base64Image = imgBuffer.toString("base64");
@@ -263,9 +240,7 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [
-          { parts: [{ text: prompt }, { inlineData: { mimeType: "image/png", data: base64Image } }] },
-        ],
+        contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: "image/png", data: base64Image } }] }],
         generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 } },
       }),
     });
@@ -281,9 +256,7 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
     const textPart = candidate?.content?.parts?.find((p: any) => p.text);
     if (!textPart) throw new Error("Gemini remove-bg: no text response");
 
-    const jsonMatch = textPart.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error(`Gemini remove-bg: no JSON found. Got: ${textPart.text.slice(0, 200)}`);
-    const seg: SegmentationBox = JSON.parse(jsonMatch[0]);
+    const seg: SegmentationBox = parseJsonPayload(textPart.text);
     if (!seg.mask) return { imageUrl: "" };
 
     const sharp = await import("sharp");
@@ -291,20 +264,17 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
     const imgMeta = await sharp.default(imgBuffer).metadata();
     const canvasW = imgMeta.width || 1024;
     const canvasH = imgMeta.height || 576;
+    const box = normalizeBox(seg.box_2d);
 
     let maskCanvas: Buffer;
-    if (seg.box_2d && seg.box_2d.length === 4) {
-      const [y1, x1, y2, x2] = seg.box_2d;
+    if (box) {
+      const [y1, x1, y2, x2] = box;
       const bx = Math.round((x1 / 1000) * canvasW);
       const by = Math.round((y1 / 1000) * canvasH);
-      const bw = Math.round(((x2 - x1) / 1000) * canvasW);
-      const bh = Math.round(((y2 - y1) / 1000) * canvasH);
+      const bw = Math.max(1, Math.round(((x2 - x1) / 1000) * canvasW));
+      const bh = Math.max(1, Math.round(((y2 - y1) / 1000) * canvasH));
 
-      const resized = await sharp.default(maskData)
-        .resize(Math.max(1, bw), Math.max(1, bh), { fit: "fill" })
-        .png()
-        .toBuffer();
-
+      const resized = await sharp.default(maskData).resize(bw, bh, { fit: "fill" }).png().toBuffer();
       maskCanvas = await sharp.default({
         create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
       })
@@ -312,13 +282,9 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
         .png()
         .toBuffer();
     } else {
-      maskCanvas = await sharp.default(maskData)
-        .resize(canvasW, canvasH, { fit: "fill" })
-        .png()
-        .toBuffer();
+      maskCanvas = await sharp.default(maskData).resize(canvasW, canvasH, { fit: "fill" }).png().toBuffer();
     }
 
-    // Get binary alpha channel via sharp threshold + raw
     const alphaRaw = await sharp.default(maskCanvas)
       .resize(canvasW, canvasH, { fit: "fill" })
       .grayscale()
@@ -326,7 +292,6 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
       .raw()
       .toBuffer();
 
-    // Apply as alpha channel — removeAlpha + joinChannel with raw option
     const result = await sharp.default(imgBuffer)
       .removeAlpha()
       .joinChannel(alphaRaw, { raw: { width: canvasW, height: canvasH, channels: 1 } })
@@ -334,6 +299,85 @@ Coordinates 0–1000. Return ONLY the JSON, no other text.`;
       .toBuffer();
 
     return { imageUrl: `data:image/png;base64,${result.toString("base64")}` };
+  }
+
+  private async detectComponents(base64Image: string, prompt: string, W: number, H: number): Promise<NormalizedComponent[]> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${SEGMENTATION_MODEL}:generateContent?key=${this.apiKey}`;
+    const res = await fetchWithRetry(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: "image/png", data: base64Image } }] }],
+        generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: "application/json" },
+      }),
+    });
+
+    if (!res.ok) {
+      console.warn(`[Gemini extract] API error ${res.status}: ${await res.text()}`);
+      return [];
+    }
+
+    const data = await res.json();
+    const textPart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
+    if (!textPart) return [];
+
+    try {
+      const parsed = parseJsonPayload(textPart.text);
+      return coerceElements(parsed)
+        .map((item, index) => {
+          const box = normalizeBox(item.box_2d);
+          if (!box) return null;
+          const type = normalizeLabel(item.type || item.label);
+          const name = item.name || item.label || `${type}_${index + 1}`;
+          const areaPct = ((box[2] - box[0]) / 1000) * ((box[3] - box[1]) / 1000);
+          if (areaPct < 0.00025 || areaPct > 0.92) return null;
+          return { name, type, imageUrl: "", box2d: box, confidence: item.confidence ?? 0.75 };
+        })
+        .filter(Boolean) as NormalizedComponent[];
+    } catch (err) {
+      console.warn("[Gemini extract] parse failed:", err instanceof Error ? err.message : err);
+      return [];
+    }
+  }
+
+  private async detectByZones(imgBuffer: Buffer, W: number, H: number): Promise<NormalizedComponent[]> {
+    const sharp = await import("sharp");
+    const zones: { name: string; x: number; y: number; w: number; h: number; prompt: string }[] = [
+      { name: "TOP", x: 0, y: 0, w: W, h: Math.round(H * 0.16), prompt: "Detect all top HUD UI components: avatar, bars, icons, badges, and buttons. Return JSON {\"elements\":[{\"name\":\"...\",\"type\":\"BAR\",\"box_2d\":[y1,x1,y2,x2],\"confidence\":0.9}]}. Coordinates 0-1000 relative to this crop." },
+      { name: "LEFT", x: 0, y: 0, w: Math.round(W * 0.24), h: H, prompt: "Detect all left side UI icons, buttons, badges, and panels. Return JSON {\"elements\":[{\"name\":\"...\",\"type\":\"ICON\",\"box_2d\":[y1,x1,y2,x2],\"confidence\":0.9}]}. Coordinates 0-1000 relative to this crop." },
+      { name: "RIGHT", x: Math.round(W * 0.76), y: 0, w: Math.round(W * 0.24), h: H, prompt: "Detect all right side UI icons, buttons, badges, and panels. Return JSON {\"elements\":[{\"name\":\"...\",\"type\":\"ICON\",\"box_2d\":[y1,x1,y2,x2],\"confidence\":0.9}]}. Coordinates 0-1000 relative to this crop." },
+      { name: "CENTER", x: Math.round(W * 0.12), y: Math.round(H * 0.10), w: Math.round(W * 0.76), h: Math.round(H * 0.78), prompt: "Detect center UI components: main panels, cards, large buttons, characters, sprites, badges, and icons. Return JSON {\"elements\":[{\"name\":\"...\",\"type\":\"PANEL\",\"box_2d\":[y1,x1,y2,x2],\"confidence\":0.9}]}. Coordinates 0-1000 relative to this crop." },
+      { name: "BOTTOM", x: 0, y: Math.round(H * 0.84), w: W, h: Math.round(H * 0.16), prompt: "Detect bottom navigation tabs, buttons, icons, badges, and bars. Return JSON {\"elements\":[{\"name\":\"...\",\"type\":\"BUTTON\",\"box_2d\":[y1,x1,y2,x2],\"confidence\":0.9}]}. Coordinates 0-1000 relative to this crop." },
+    ];
+
+    const results = await Promise.all(
+      zones.map(async (zone) => {
+        const cropBuffer = await sharp.default(imgBuffer)
+          .extract({ left: zone.x, top: zone.y, width: zone.w, height: zone.h })
+          .png()
+          .toBuffer();
+        const cropComponents = await this.detectComponents(cropBuffer.toString("base64"), zone.prompt, zone.w, zone.h);
+        return cropComponents.map((component) => {
+          const [y1, x1, y2, x2] = component.box2d;
+          const y1Px = (y1 / 1000) * zone.h + zone.y;
+          const x1Px = (x1 / 1000) * zone.w + zone.x;
+          const y2Px = (y2 / 1000) * zone.h + zone.y;
+          const x2Px = (x2 / 1000) * zone.w + zone.x;
+          return {
+            ...component,
+            name: `${zone.name}_${component.name}`,
+            box2d: [
+              (y1Px / H) * 1000,
+              (x1Px / W) * 1000,
+              (y2Px / H) * 1000,
+              (x2Px / W) * 1000,
+            ] as [number, number, number, number],
+          };
+        });
+      })
+    );
+
+    return nms(results.flat());
   }
 
   private async fetchImageForSegmentation(imageUrl: string): Promise<Buffer> {
