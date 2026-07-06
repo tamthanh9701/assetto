@@ -15,7 +15,7 @@ export default async function AssetsPage() {
     where: { scene: { project: { userId: session?.user?.id } } },
     include: {
       scene: { select: { prompt: true } },
-      componentGroup: { select: { name: true } },
+      componentGroup: { select: { name: true, type: true } },
     },
     orderBy: { createdAt: "desc" },
     take: 50,
@@ -59,10 +59,15 @@ export default async function AssetsPage() {
                   )}
                 </div>
                 <p className="text-sm font-medium truncate">{asset.name}</p>
-                <div className="flex gap-1 mt-1">
+                <div className="flex gap-1 mt-1 flex-wrap">
                   <Badge variant="secondary" className="text-xs">
-                    {asset.type}
+                    {asset.componentGroup?.type || asset.type}
                   </Badge>
+                  {asset.subType && (
+                    <Badge variant="outline" className="text-xs">
+                      {asset.subType}
+                    </Badge>
+                  )}
                   {asset.transparent && (
                     <Badge variant="outline" className="text-xs">
                       PNG
